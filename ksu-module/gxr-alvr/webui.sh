@@ -11,6 +11,12 @@ TRACE=/sys/kernel/tracing
 
 readval() { [ -f "$MODDIR/$1" ] && cat "$MODDIR/$1" 2>/dev/null; }
 
+# numval <text> -> canonical "%.3f" on stdout, exit 1 when it is not a number in (0,100]
+numval() {
+  case "$1" in ''|.|*[!0-9.]*|*.*.*) return 1 ;; esac
+  awk -v a="$1" 'BEGIN { if (a + 0 <= 0 || a + 0 > 100) exit 1; printf "%.3f", a + 0 }'
+}
+
 case "$1" in
   status)
     echo "pc=$(readval pc)"
@@ -19,6 +25,9 @@ case "$1" in
     echo "tongue=$(readval tongue)"
     echo "verbose=$([ -f "$MODDIR/verbose" ] && echo 1 || echo 0)"
     echo "paused=$([ -f "$PAUSED" ] && echo 1 || echo 0)"
+    echo "dilmin=$(readval dilmin)"
+    echo "dilmax=$(readval dilmax)"
+    echo "dillock=$([ -f "$MODDIR/dillock" ] && echo 1 || echo 0)"
     dv=""
     if [ -f "$MODDIR/devopts" ]; then dv=$(sed 's/ /=/' "$MODDIR/devopts" | tr '\n' ';'); dv=${dv%;}; fi
     echo "devopts=$dv"
@@ -64,6 +73,80 @@ case "$1" in
     sh "$MODDIR/action.sh" >/dev/null 2>&1
     sleep 1
     echo "ok=1"
+    echo "pid=$(pidof gxr_alvr 2>/dev/null)"
+    ;;
+  dilcal)
+    # dilcal lock|unlock|reset|set <min> <max>
+    # Freeze the learned dilation range, release it, forget it, or write a range by
+    # hand. The relay owns the numbers - it writes dilmin/dilmax as it learns and
+    # flushes them on a clean exit - so the order of the file operations matters:
+    #   - reset/set must stop the relay BEFORE touching the files, or that exit
+    #     flush overwrites what was just written (or recreates what was deleted);
+    #   - lock only adds the marker, so the values it freezes are the ones the
+    #     running relay actually ended with.
+    # Validation for "set" runs before anything is stopped: a typo must not
+    # interrupt tracking.
+    if [ -f "$PAUSED" ]; then
+      echo "error=module is paused; resume it first"
+      exit 1
+    fi
+    case "$2" in
+      lock)
+        LO=$(readval dilmin); HI=$(readval dilmax)
+        if [ -z "$LO" ] || [ -z "$HI" ]; then
+          echo "error=no learned dilation range yet (use face tracking first)"
+          exit 1
+        fi
+        if ! awk -v a="$LO" -v b="$HI" 'BEGIN { exit !(a + 0 > 0 && b + 0 > a + 0 && b + 0 <= 100) }'; then
+          echo "error=stored dilation range is not usable ($LO..$HI)"
+          exit 1
+        fi
+        : > "$MODDIR/dillock"
+        ;;
+      unlock)
+        # An explicit --dil-min/--dil-max pair in devopts outranks these files and
+        # re-locks the relay on every start; pretending to unlock would lie.
+        if grep -q -e '^--dil-min ' -e '^--dil-max ' "$MODDIR/devopts" 2>/dev/null; then
+          echo "error=--dil-min/--dil-max are set in Developer options; clear them first"
+          exit 1
+        fi
+        rm -f "$MODDIR/dillock" 2>/dev/null
+        ;;
+      reset|set)
+        if grep -q -e '^--dil-min ' -e '^--dil-max ' "$MODDIR/devopts" 2>/dev/null; then
+          echo "error=--dil-min/--dil-max are set in Developer options; clear them first"
+          exit 1
+        fi
+        if [ "$2" = "set" ]; then
+          LO=$(numval "$3") || { echo "error=min must be a number in 0..100"; exit 1; }
+          HI=$(numval "$4") || { echo "error=max must be a number in 0..100"; exit 1; }
+          awk -v a="$LO" -v b="$HI" 'BEGIN { exit !(b + 0 > a + 0) }' \
+            || { echo "error=min must be below max"; exit 1; }
+        fi
+        pkill -f "$MODDIR/supervise.sh --loop" 2>/dev/null
+        sleep 1
+        pkill -x gxr_alvr 2>/dev/null
+        sleep 1
+        pidof gxr_alvr >/dev/null 2>&1 && { pkill -9 -x gxr_alvr 2>/dev/null; sleep 1; }
+        if [ "$2" = "set" ]; then
+          printf '%s\n' "$LO" > "$MODDIR/dilmin"
+          printf '%s\n' "$HI" > "$MODDIR/dilmax"
+          : > "$MODDIR/dillock"
+        else
+          rm -f "$MODDIR/dillock" "$MODDIR/dilmin" "$MODDIR/dilmax" 2>/dev/null
+        fi
+        ;;
+      *)
+        echo "error=usage: dilcal lock|unlock|reset|set <min> <max>"
+        exit 2
+        ;;
+    esac
+    sh "$MODDIR/action.sh" >/dev/null 2>&1
+    sleep 1
+    echo "ok=1"
+    echo "dilmin=$(readval dilmin)"
+    echo "dilmax=$(readval dilmax)"
+    echo "dillock=$([ -f "$MODDIR/dillock" ] && echo 1 || echo 0)"
     echo "pid=$(pidof gxr_alvr 2>/dev/null)"
     ;;
   pause)
@@ -133,7 +216,7 @@ case "$1" in
     fi
     ;;
   *)
-    echo "error=usage: status | set <pc|-|auto> <port> <tongue> <verbose> | setdev <spec|-> | pause | resume | exportlog | test <ip>"
+    echo "error=usage: status | set <pc|-|auto> <port> <tongue> <verbose> | setdev <spec|-> | dilcal lock|unlock|reset | pause | resume | exportlog | test <ip>"
     exit 2
     ;;
 esac

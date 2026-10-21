@@ -111,6 +111,32 @@
     <div id="save-result" class="hint"></div>
   </div>
 
+  <div class="card">
+    <h2>Dilation range <span id="dil-state" class="pill">-</span></h2>
+    <dl>
+      <dt>Learned range</dt><dd id="s-dil" class="mono">-</dd>
+    </dl>
+    <label for="dil-min">Set the range by hand</label>
+    <div class="row">
+      <input type="number" id="dil-min" inputmode="decimal" step="0.01" min="0.1" max="99" placeholder="min">
+      <input type="number" id="dil-max" inputmode="decimal" step="0.01" min="0.2" max="100" placeholder="max">
+      <button id="btn-dil-apply" title="Write these values and lock the range">Use these values</button>
+    </div>
+    <div class="btns">
+      <button id="btn-dil-lock" title="Freeze the learned range">Lock</button>
+      <button id="btn-dil-unlock" title="Let the relay learn the range again">Unlock</button>
+      <button id="btn-dil-reset" title="Forget the learned range">Reset</button>
+    </div>
+    <div class="hint">VRCFT normalizes pupil dilation against this range, so it sets how
+      much movement the avatar shows. The relay learns it from clean frames and remembers
+      it across restarts. Type your own min/max and press <b>Use these values</b> to skip
+      calibration entirely - that writes both numbers and locks them. Lock freezes the
+      learned range (the usual choice once it has settled, and the fix for one stray reading
+      squeezing it); Unlock lets it adapt again after a big change in light level; Reset
+      forgets it and learns from scratch.</div>
+    <div id="dil-result" class="hint"></div>
+  </div>
+
   <details class="card" id="dev-card">
     <summary><h2>Developer options</h2></summary>
     <p class="devnote">Optional sender tuning. Values are passed straight to
@@ -185,7 +211,31 @@ function parseKV(out) {
 function setBusy(b) {
   BUSY = b;
   ["btn-save", "btn-refresh", "btn-test", "btn-dev-save", "btn-dev-reset",
-   "btn-pause", "btn-resume", "btn-export"].forEach(function (id) { $(id).disabled = b; });
+   "btn-pause", "btn-resume", "btn-export",
+   "btn-dil-lock", "btn-dil-unlock", "btn-dil-reset", "btn-dil-apply",
+   "dil-min", "dil-max"].forEach(function (id) { $(id).disabled = b; });
+}
+
+/* Dilation range: the relay owns the numbers (it writes them as it learns), so
+   the page only shows them and toggles the lock. Called after setBusy(false). */
+function applyDilState(s) {
+  var lo = parseFloat(s.dilmin), hi = parseFloat(s.dilmax);
+  var have = isFinite(lo) && isFinite(hi) && hi > lo;
+  $("s-dil").textContent = have
+    ? lo.toFixed(3) + " .. " + hi.toFixed(3)
+    : "(not learned yet - use face tracking for a minute)";
+  var locked = (s.dillock === "1");
+  var paused = (s.paused === "1");
+  $("dil-state").textContent = paused ? "paused" : (locked ? "locked" : "learning");
+  $("dil-state").className = "pill" + (locked && !paused ? " ok" : (paused ? " warn" : ""));
+  /* Prefill the hand-entry fields with the range in force, so editing it starts
+     from the current numbers instead of a blank sheet. */
+  if (document.activeElement !== $("dil-min")) $("dil-min").value = have ? lo.toFixed(3) : "";
+  if (document.activeElement !== $("dil-max")) $("dil-max").value = have ? hi.toFixed(3) : "";
+  $("btn-dil-lock").disabled = paused || locked || !have;
+  $("btn-dil-unlock").disabled = paused || !locked;
+  $("btn-dil-reset").disabled = paused || (!have && !locked);
+  $("btn-dil-apply").disabled = paused;
 }
 
 /* Pause/resume only make sense one way round: Pause needs a running relay,
@@ -201,14 +251,27 @@ function applyRelayState(s) {
   $("btn-resume").disabled = running && !paused;
 }
 
-function refresh() {
-  setBusy(true);
+/* The page used to read the status once at load and never again: the log tail,
+   the relay state and the dilation card all froze until it was reloaded, and
+   re-opening the Manager's WebUI does not necessarily reload it. It now refreshes
+   itself when it becomes visible again and every 10 s while visible, unless an
+   action is running or an input is focused (the PC/port/dev fields are written
+   from the status, so a hidden refresh while typing would wipe the edit). */
+function typing() {
+  var a = document.activeElement;
+  if (!a) return false;
+  var t = (a.tagName || "").toUpperCase();
+  return t === "INPUT" || t === "SELECT" || t === "TEXTAREA";
+}
+
+function refresh(silent) {
+  if (!silent) setBusy(true);
   ksuExec("sh " + MOD + "/webui.sh status").then(function (r) {
     if (r.errno !== 0 && !r.stdout) {
       $("bridge").textContent = "no root bridge";
       $("bridge").className = "pill err";
       $("s-armed").textContent = r.stderr || "unavailable";
-      setBusy(false);
+      if (!silent) setBusy(false);
       return;
     }
     $("bridge").textContent = "root ok";
@@ -223,11 +286,24 @@ function refresh() {
     $("s-pid").textContent = s.pid || "(not running)";
     $("s-pid").className = s.pid ? "mono ok" : "mono err";
     $("s-ip").textContent = (s.ip || "").replace(/,+$/, "") || "-";
-    $("s-log").textContent = (s.tail || "-").split("~").join("\n");
-    setBusy(false);
+    var log = $("s-log"), keepTop = log.scrollTop;
+    var atBottom = (keepTop + log.clientHeight >= log.scrollHeight - 4);
+    log.textContent = (s.tail || "-").split("~").join("\n");
+    log.scrollTop = atBottom ? log.scrollHeight : keepTop;
+    if (!silent) setBusy(false);
     applyRelayState(s);
+    applyDilState(s);
   });
 }
+
+function autoRefresh() {
+  if (BUSY || document.hidden || typing()) return;
+  refresh(true);
+}
+document.addEventListener("visibilitychange", function () {
+  if (!document.hidden) autoRefresh();
+});
+setInterval(autoRefresh, 10000);
 
 function validIP(v) {
   if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(v)) return false;
@@ -301,6 +377,8 @@ var DEVOPTS = [
   { f:"--pupil-dilation-gain", d:"0.75", k:"num", t:"Widens the dilation window by 1/gain. Raise toward 1.0 for a wider, more sensitive dilation range." },
   { f:"--pupil-smooth-ms", d:"350", k:"num", t:"Per-eye low-pass time constant. Higher = steadier but slower to follow." },
   { f:"--pupil-min-conf", d:"0.25", k:"num", t:"Ignore pupil detections whose confidence is below this." },
+  { f:"--dil-min", d:"", k:"num", t:"Explicit low end of the dilation range, in the scale the Dilation card shows. Set BOTH --dil-min and --dil-max to freeze the range and ignore the learned values." },
+  { f:"--dil-max", d:"", k:"num", t:"Explicit high end of the dilation range. Set BOTH ends to freeze it." },
   { f:"--wink-gap", d:"0.35", k:"num", t:"Left/right difference in eyes_closed that counts as a wink: the closing eyelid is then driven fully shut, which the raw sensor value under-reports. 0 disables it. Raise it if a wink is missed; lower it if a partial one-eye closure snaps shut." },
   { f:"--wink-ms", d:"200", k:"num", t:"How long a detected wink takes to close fully, in ms. Lower is snappier, higher is softer." },
   { f:"--tx-hz", d:"60", k:"num", t:"Datagrams per second. Lower it if this stream disturbs Wi-Fi trackers or streaming on your LAN (broadcast is the expensive kind of traffic). A pinned PC IP does not need this." },
@@ -479,6 +557,41 @@ function exportLogs() {
   });
 }
 
+/* ---- Dilation range lock/unlock/reset. The relay restarts so it starts with the
+   frozen numbers (or with none, for reset) - the same path every other setting
+   change uses. ---- */
+function dilAction(verb, busyText, okText) {
+  if (BUSY) return;
+  setBusy(true);
+  $("dil-result").textContent = busyText;
+  $("dil-result").className = "hint";
+  ksuExec("sh " + MOD + "/webui.sh dilcal " + verb).then(function (r) {
+    var s = parseKV(r.stdout);
+    if (r.errno === 0 && s.ok === "1") {
+      $("dil-result").textContent = okText;
+      $("dil-result").className = "hint ok";
+      if (typeof ksu !== "undefined" && ksu.toast) ksu.toast(okText);
+    } else {
+      $("dil-result").textContent = "Failed: " + (s.error || r.stderr || ("exit " + r.errno));
+      $("dil-result").className = "hint err";
+    }
+    refresh();
+  });
+}
+
+function applyDilValues() {
+  if (BUSY) return;
+  var lo = Number($("dil-min").value), hi = Number($("dil-max").value);
+  if (!isFinite(lo) || !isFinite(hi) || lo <= 0 || hi <= lo || hi > 100) {
+    $("dil-result").textContent = "Enter two numbers with 0 < min < max <= 100.";
+    $("dil-result").className = "hint err";
+    return;
+  }
+  dilAction("set " + lo.toFixed(3) + " " + hi.toFixed(3),
+            "Writing the range and restarting the relay...",
+            "Saved: the dilation range is locked at these values");
+}
+
 document.addEventListener("DOMContentLoaded", function () {
   renderDev();
   $("btn-save").addEventListener("click", save);
@@ -489,6 +602,19 @@ document.addEventListener("DOMContentLoaded", function () {
   $("btn-pause").addEventListener("click", pauseRelay);
   $("btn-resume").addEventListener("click", resumeRelay);
   $("btn-export").addEventListener("click", exportLogs);
+  $("btn-dil-lock").addEventListener("click", function () {
+    dilAction("lock", "Freezing the dilation range...",
+              "Locked: the dilation range is frozen at the learned values");
+  });
+  $("btn-dil-unlock").addEventListener("click", function () {
+    dilAction("unlock", "Releasing the dilation range...",
+              "Unlocked: the range adapts again");
+  });
+  $("btn-dil-reset").addEventListener("click", function () {
+    dilAction("reset", "Forgetting the learned range...",
+              "Reset: the range will be learned again from clean frames");
+  });
+  $("btn-dil-apply").addEventListener("click", applyDilValues);
   refresh();
 });
 </script>

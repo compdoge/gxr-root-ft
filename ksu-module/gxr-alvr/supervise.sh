@@ -99,7 +99,7 @@ pidof gxr_alvr >/dev/null 2>&1 && { pkill -9 -x gxr_alvr 2>/dev/null; sleep 1; }
 chmod 666 "$LOG" 2>/dev/null
 
 # ---- start (EXTRA is a validated flag list, so word-splitting it is intended) ----
-set -- "$BIN" --port "$PORT"
+set -- "$BIN" --port "$PORT" --state-dir "$MODDIR"
 [ -n "$PC" ] && set -- "$@" --pc "$PC"
 for a in $EXTRA; do set -- "$@" "$a"; done
 setsid sh "$MODDIR/supervise.sh" --loop "$@" &

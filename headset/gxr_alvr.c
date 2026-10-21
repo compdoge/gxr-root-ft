@@ -61,7 +61,7 @@
 
 /* Reported in the startup log and by --version, so the running build is always
    identifiable (avoids "is the new binary actually live?" confusion). */
-#define GXR_VERSION "1.3.9"
+#define GXR_VERSION "1.3.11"
 
 #define TRACE "/sys/kernel/tracing"
 /* Per-CPU trace ring buffer. The probes fire about 330 times a second, which is
@@ -156,6 +156,32 @@ static float PUPIL_SMOOTH_MS = 350.0f;    /* per-eye low-pass time constant (ms)
 #define PUPIL_WINDOW_OPEN 0.8f     /* dilation envelope only grows while both lids are >= this open */
 #define PUPIL_WINDOW_DWELL_MS 300  /* ...and a new extreme must persist this long to be committed */
 #define PUPIL_WINDOW_CONFIRM 0.15f /* ...staying within this (mm) of the candidate extreme */
+
+/* Dilation range persistence, seeding and healing (v1.3.11).
+   The envelope is what VRCFT normalizes against, so a bad seed or one stray
+   compresses the whole avatar range for the rest of the session. Measured: two
+   runs minutes apart seeded 3.75 vs 3.29 mm from one unchecked frame and kept
+   that 10% difference, and the envelope only ever grew wider. The state files
+   keep the learned window across restarts; a median of the first clean frames
+   replaces the single-frame seed; an extreme also has to still match the RAW
+   reading when it is committed (the EMA tail of one bad detection outlives the
+   300 ms dwell, which is how a 0.5 mm stray got through); and a stale extreme is
+   pulled back toward the recent p2/p98, slowly, so a stray cannot survive for
+   the whole session. */
+#define COMPUTE_PERIOD_MS 16         /* recompute at most this often (the probes cap out ~57 Hz) */
+#define DIL_HEAL_MIN_SPAN 0.5f       /* heal nothing if the recent swing is narrower than this */
+#define DIL_SEED_BUF 16              /* clean samples collected for the seed */
+#define DIL_SEED_MIN 8               /* ...the median is used once this many arrived */
+#define DIL_SEED_SAMPLE_MS 50        /* ...one sample per this interval, not per loop tick */
+#define DIL_SEED_TIMEOUT_MS 2000     /* ...and this long without enough clean frames falls back */
+#define DIL_HEAL_RING 256            /* clean samples kept for the healing check */
+#define DIL_HEAL_SAMPLE_MS 500       /* one history sample per this interval (~2 min of ring) */
+#define DIL_HEAL_WINDOW_MS 120000    /* only samples from this recent window are compared */
+#define DIL_HEAL_PERIOD_MS 30000     /* evaluate healing this often */
+#define DIL_HEAL_STALE_MS 600000     /* an extreme not approached for this long is stale */
+#define DIL_HEAL_NEAR 0.10f          /* "approached" = a clean sample this close (mm) */
+#define DIL_HEAL_GAP 0.25f           /* ...and it must be this far from the recent p2/p98 */
+#define DIL_HEAL_STEP 0.5f           /* move this fraction of the gap per check */
 #define PUPIL_GAIN_MIN 0.05f       /* floor on the dilation gain divisor */
 #define PUPIL_DET_FRESH_MS 250     /* a detection older than this is stale */
 #define PUPIL_LOG_MS 250           /* --verbose pupil line cadence (fast, to catch a wink) */
@@ -667,6 +693,20 @@ static float g_minMm = 0.0f, g_maxMm = 0.0f;
 static int g_have_pupil = 0;
 static float g_lastMm = 0.0f, g_lastMin = 0.0f, g_lastMax = 0.0f;
 static long long g_pupilAcceptMs;   /* last frame a pupil reading was accepted */
+/* dilation range state: persistence, lock, seed and healing (see the constants) */
+static const char *g_stateDir;      /* --state-dir: where dilmin/dilmax/dillock live */
+static int g_dilLock;               /* locked: emit the window as-is, never learn or write */
+static int g_winLoaded;             /* window came from the state files (or --dil-min/max) */
+static int g_winSaveable;           /* the window is trustworthy enough to persist */
+static int g_seeded;                /* seed phase over: the envelope may learn again */
+static int g_seedN;                 /* clean samples collected for the seed */
+static float g_seedBuf[DIL_SEED_BUF];
+static long long g_seedStartMs, g_seedSampleMs;
+static long long g_minTouchMs, g_maxTouchMs;  /* last clean sample near each committed extreme */
+static float g_healRing[DIL_HEAL_RING];
+static long long g_healRingMs[DIL_HEAL_RING];
+static int g_healIdx, g_healN;
+static long long g_healSampleMs, g_healCheckMs;
 /* per-eye pupil tracking (0 = left: detections 0/1, 1 = right: detections 2/3) */
 static float g_eyeS[2];         /* smoothed per-eye pupil diameter (mm) */
 static long long g_eyeMs[2];    /* last time this eye produced a usable reading */
@@ -775,12 +815,22 @@ static void print_done(void) {
 static volatile sig_atomic_t g_maint;   /* a tracefs maintenance op is running */
 static long long g_evCount;             /* OUR probe events parsed */
 static long long g_txCount;             /* datagrams sent */
+static long long g_computeCount;        /* frames computed (should track the tx rate) */
 static int g_quietCount;                /* quiet episodes logged so far */
 static int g_quietActive;               /* already logged this quiet episode */
 static int g_hbMs = HB_MS;              /* heartbeat interval, slowed past the cap */
 static float g_ue[UE_MAX], g_tail[TAIL_N];   /* last computed frame */
 static int g_stateOk;                        /* a frame has been computed */
 static long long g_lastTxMs, g_lastDataMs;   /* last datagram sent / last device upline */
+/* Recompute-on-dirty. compute_and_send() used to run from the face-blendshape
+   branch only, so the whole frame - gaze and pupil included - advanced at the
+   vendor's ~15 Hz expression rate while eye direction arrived at ~57 Hz and
+   pupil at ~42 Hz. Anything that changes the frame now just marks it dirty and
+   the loop recomputes once per transmit period (16 ms at the default 60 Hz), so
+   gaze and pupil follow their real rate without paying for a recompute per
+   event. Expressions themselves cannot get faster than their source. */
+static int g_dirty;
+static long long g_lastComputeMs;
 
 /* Dormant: no probe event recently, so there is nothing to parse and nothing to
    say past a keepalive. Dormant from the start too (g_lastDataMs is 0 until the
@@ -849,8 +899,167 @@ static float tongue_readout(const float x[TONGUE_IN], const float dof[TONGUE_DOF
     return s;
 }
 
+/* ---------------- dilation range state ----------------
+   Files live in the module directory (--state-dir; supervise.sh passes it):
+     dilmin, dilmax  the learned envelope, written when an extreme is committed
+     dillock         present = frozen: emit exactly this window, learn nothing
+   The WebUI's Lock/Unlock writes the marker and restarts the relay, so the
+   frozen values are always the last ones the relay persisted. */
+static void state_path(char *buf, size_t n, const char *name) {
+    if (!g_stateDir || !g_stateDir[0]) { buf[0] = '\0'; return; }
+    snprintf(buf, n, "%s/%s", g_stateDir, name);
+}
+
+static int state_read_float(const char *name, float *out) {
+    char p[512];
+    state_path(p, sizeof(p), name);
+    if (!p[0]) return -1;
+    FILE *f = fopen(p, "r");
+    if (!f) return -1;
+    float v = 0.0f;
+    int got = (fscanf(f, "%f", &v) == 1);
+    fclose(f);
+    if (!got || !(v > 0.0f) || v > 100.0f) return -1;   /* junk never becomes a seed */
+    *out = v;
+    return 0;
+}
+
+static int state_exists(const char *name) {
+    char p[512];
+    state_path(p, sizeof(p), name);
+    return p[0] && access(p, F_OK) == 0;
+}
+
+static void state_write_float(const char *name, float v) {
+    static int warned;
+    char p[512], tmp[544];
+    state_path(p, sizeof(p), name);
+    if (!p[0]) return;
+    snprintf(tmp, sizeof(tmp), "%s.tmp", p);
+    FILE *f = fopen(tmp, "w");
+    if (!f) {
+        if (!warned) { warned = 1; fprintf(stderr, "gxr_alvr: cannot write %s: %s\n", p, strerror(errno)); }
+        return;
+    }
+    fprintf(f, "%.3f\n", (double)v);
+    if (fclose(f) != 0 || rename(tmp, p) != 0) {
+        if (!warned) { warned = 1; fprintf(stderr, "gxr_alvr: cannot save %s: %s\n", p, strerror(errno)); }
+        unlink(tmp);   /* never leave a half-written file */
+        return;
+    }
+    chmod(p, 0644);
+}
+
+static void state_unlink(const char *name) {
+    char p[512];
+    state_path(p, sizeof(p), name);
+    if (p[0]) unlink(p);
+}
+
+static float median_of(const float *src, int n) {
+    float tmp[DIL_SEED_BUF];
+    if (n <= 0) return 0.0f;
+    if (n > (int)(sizeof(tmp) / sizeof(tmp[0]))) n = (int)(sizeof(tmp) / sizeof(tmp[0]));
+    memcpy(tmp, src, (size_t)n * sizeof(float));
+    qsort(tmp, (size_t)n, sizeof(float), cmpf);
+    return tmp[n / 2];
+}
+
+static void dil_load(void) {
+    long long now = now_ms();
+    float lo = 0.0f, hi = 0.0f;
+    int haveLo = state_read_float("dilmin", &lo) == 0;
+    int haveHi = state_read_float("dilmax", &hi) == 0;
+    g_dilLock = state_exists("dillock");
+    /* hi - lo <= 5 mm rejects a pair torn between two commits (the files are
+       written one at a time); a real envelope is well under that. */
+    if (haveLo && haveHi && hi > lo && hi - lo <= 5.0f) {
+        g_minMm = lo; g_maxMm = hi;
+        g_winLoaded = 1; g_winSaveable = 1; g_seeded = 1;
+        g_winMinCand = lo; g_winMaxCand = hi;
+        g_winMinMs = g_winMaxMs = now;
+        g_minTouchMs = g_maxTouchMs = now;
+        fprintf(stderr, "gxr_alvr: dilation range loaded: %.3f..%.3f mm%s\n",
+                (double)lo, (double)hi, g_dilLock ? " (locked)" : " (learning continues)");
+    } else if (g_dilLock) {
+        /* Never leave a marker that the UI trusts while the relay is learning:
+           a copied or interrupted pair would otherwise report "locked" forever. */
+        state_unlink("dillock");
+        g_dilLock = 0;
+        fprintf(stderr, "gxr_alvr: dillock present but dilmin/dilmax are missing or invalid; "
+                        "removed it and learning the range instead\n");
+    }
+}
+
+static void dil_save(void) {
+    if (!g_stateDir || g_dilLock || !g_have_pupil || !g_seeded || !g_winSaveable) return;
+    state_write_float("dilmin", g_minMm);
+    state_write_float("dilmax", g_maxMm);
+}
+
+/* Keep a short history of CLEAN samples (~2 min) plus when each committed
+   extreme was last approached, which is all the healing check needs. */
+static void dil_history(float mm, int clean, long long now) {
+    if (!clean || now - g_healSampleMs < DIL_HEAL_SAMPLE_MS) return;
+    g_healSampleMs = now;
+    g_healRing[g_healIdx] = mm;
+    g_healRingMs[g_healIdx] = now;
+    g_healIdx = (g_healIdx + 1) % DIL_HEAL_RING;
+    if (g_healN < DIL_HEAL_RING) g_healN++;
+    if (mm <= g_minMm + DIL_HEAL_NEAR) g_minTouchMs = now;
+    if (mm >= g_maxMm - DIL_HEAL_NEAR) g_maxTouchMs = now;
+}
+
+/* A stray that still got committed would otherwise stay in the window forever
+   (the envelope only grows). If the user has not come near an extreme for
+   DIL_HEAL_STALE_MS, move it halfway toward the recent p2/p98 - slowly, so a
+   single odd window cannot yank the range around. */
+static void dil_heal(long long now) {
+    if (g_dilLock || !g_seeded || g_healN < DIL_HEAL_RING / 4) return;
+    if (now - g_healCheckMs < DIL_HEAL_PERIOD_MS) return;
+    g_healCheckMs = now;
+    float tmp[DIL_HEAL_RING];
+    int m = 0;
+    for (int i = 0; i < g_healN; i++) {
+        int q = (g_healIdx - 1 - i + 2 * DIL_HEAL_RING) % DIL_HEAL_RING;
+        if (now - g_healRingMs[q] > DIL_HEAL_WINDOW_MS) continue;
+        tmp[m++] = g_healRing[q];
+    }
+    if (m < 16) return;
+    qsort(tmp, (size_t)m, sizeof(float), cmpf);
+    float p2 = tmp[(int)(0.02f * (float)(m - 1) + 0.5f)];
+    float p98 = tmp[(int)(0.98f * (float)(m - 1) + 0.5f)];
+    /* A stable pupil is not evidence that the range collapsed. Without this gate
+       an hour of sitting still in steady light healed a 3.0..6.0 window down to a
+       sliver, which makes the avatar wildly sensitive. */
+    if (p98 - p2 < DIL_HEAL_MIN_SPAN) return;
+    int moved = 0;
+    float lo = g_minMm, hi = g_maxMm;
+    if (now - g_minTouchMs > DIL_HEAL_STALE_MS && p2 > lo + DIL_HEAL_GAP) {
+        float next = lo + DIL_HEAL_STEP * (p2 - lo);
+        if (next > hi - DIL_HEAL_MIN_SPAN) next = hi - DIL_HEAL_MIN_SPAN;
+        if (next > lo) { lo = next; g_minTouchMs = now; moved = 1; }
+    }
+    if (now - g_maxTouchMs > DIL_HEAL_STALE_MS && p98 < hi - DIL_HEAL_GAP) {
+        float next = hi + DIL_HEAL_STEP * (p98 - hi);
+        if (next < lo + DIL_HEAL_MIN_SPAN) next = lo + DIL_HEAL_MIN_SPAN;
+        if (next < hi) { hi = next; g_maxTouchMs = now; moved = 1; }
+    }
+    if (moved) {
+        fprintf(stderr, "gxr_alvr: dilation range healed %.3f..%.3f -> %.3f..%.3f mm "
+                        "(recent p2/p98 %.3f/%.3f)\n",
+                (double)g_minMm, (double)g_maxMm, (double)lo, (double)hi,
+                (double)p2, (double)p98);
+        g_minMm = lo; g_maxMm = hi;
+        g_winMinCand = lo; g_winMaxCand = hi;
+        g_winMinMs = g_winMaxMs = now;
+        dil_save();
+    }
+}
+
 static void compute_and_send(void) {
     long long now = now_ms();
+    g_computeCount++;
     float *ue = g_ue, *tail = g_tail; memset(ue, 0, sizeof(g_ue));
 
     /* 1) 68 -> UE */
@@ -889,6 +1098,13 @@ static void compute_and_send(void) {
     /* 4) tail */
     memset(tail, 0, sizeof(g_tail));
     tail[T_Version] = 1.0f;
+    /* Until the first pupil detection these are what the PC sees: a plausible
+       4.5 mm inside a 3..6 window. Without them a frame sent before the first
+       pupil arrived carried pupil=0 with min=max=0, i.e. (0-0)/(0-0), which the
+       next page of this story knows as a NaN. Now that dir/pten events recompute
+       the frame, that frame is reachable at every session start. */
+    tail[T_MinDil] = 3.0f; tail[T_MaxDil] = 6.0f;
+    tail[T_LPupil] = 4.5f; tail[T_RPupil] = 4.5f;
 
     if (haveFace) {
         /* eyes_closed (face 12/13) is the raw value: the device folds the lid
@@ -922,6 +1138,13 @@ static void compute_and_send(void) {
         }
         tail[T_LOpen] = 1.0f - closedL;
         tail[T_ROpen] = 1.0f - closedR;
+    } else {
+        /* No face frame yet, or the expression stream stopped. The UE block above
+           is all zeros, which is a NEUTRAL face, so the lids must be open too.
+           Leaving the memset's 0 here used to be unreachable (compute ran only
+           right after a face frame); now that dir/pten events also recompute, it
+           would shut the avatar's eyes at session start and during any stall. */
+        tail[T_LOpen] = 1.0f; tail[T_ROpen] = 1.0f;
     }
 
     /* 3b) pupil: per eye, smoothed, with a drift-based fallback so a wink no
@@ -991,31 +1214,78 @@ static void compute_and_send(void) {
     if (nd > 0) {
         /* The dilation envelope (min/max pupil) is what VRCFT normalizes against
            -- the module feeds it our window every frame -- so it must reflect the
-           user's real range and nothing else. It therefore grows only from frames
+           user's real range and nothing else. It therefore only learns from frames
            that are fully trustworthy: both eyes reading cleanly (never occluded)
-           with both lids clearly open, and a new extreme has to persist for
-           PUPIL_WINDOW_DWELL_MS before it is committed. A squint, a blink, or bad
-           data (e.g. the headset briefly off) can no longer widen the window and
-           flatten the whole dilation range. */
+           with both lids clearly open. Three things keep a bad value out:
+             - the seed is the median of the first few CLEAN frames, not one frame;
+             - an extreme has to persist for PUPIL_WINDOW_DWELL_MS AND still match
+               the RAW reading when it is committed (the EMA tail of one bad
+               detection outlives the dwell, which is how a 0.5 mm stray got in);
+             - a stale extreme is healed back toward the recent p2/p98 (dil_heal).
+           A locked range (dillock, or --dil-min/--dil-max) learns nothing. */
         int winClean = haveFace && valid[0] && valid[1] &&
                        (tail[T_LOpen] >= PUPIL_WINDOW_OPEN) &&
                        (tail[T_ROpen] >= PUPIL_WINDOW_OPEN);
-        if (!g_have_pupil) {                            /* first reading seeds the envelope */
-            g_minMm = g_maxMm = mm;
+        if (!g_have_pupil) {                            /* first reading: provisional window */
+            if (!g_winLoaded) g_minMm = g_maxMm = mm;   /* a persisted/locked range is kept */
             g_winMinCand = g_winMaxCand = mm;
             g_winMinMs = g_winMaxMs = now;
-        } else if (winClean) {
+            g_seedN = 0;
+            g_seedStartMs = now;
+            g_seedSampleMs = 0;
+            g_seeded = g_winLoaded;                     /* a persisted range needs no seed */
+            g_minTouchMs = g_maxTouchMs = now;
+        } else if (!g_seeded) {
+            if (winClean && now - g_seedSampleMs >= DIL_SEED_SAMPLE_MS &&
+                g_seedN < DIL_SEED_BUF) {
+                g_seedSampleMs = now;
+                g_seedBuf[g_seedN++] = mm;
+                if (g_seedN >= DIL_SEED_MIN) g_minMm = g_maxMm = median_of(g_seedBuf, g_seedN);
+            }
+            if (g_seedN >= DIL_SEED_MIN || now - g_seedStartMs >= DIL_SEED_TIMEOUT_MS) {
+                g_seeded = 1;
+                if (g_seedN > 0) {
+                    g_minMm = g_maxMm = median_of(g_seedBuf, g_seedN);
+                    g_winSaveable = 1;              /* a clean seed may be persisted */
+                } else {
+                    g_minMm = g_maxMm = mm;         /* no clean frame at all: learn, do not save */
+                }
+                g_winMinCand = g_winMaxCand = (g_lastMm > 0.0f) ? g_lastMm : mm;
+                g_winMinMs = g_winMaxMs = now;
+                g_minTouchMs = g_maxTouchMs = now;
+                fprintf(stderr, "gxr_alvr: dilation seed %.3f mm (%d clean frame%s)\n",
+                        (double)g_minMm, g_seedN, g_seedN == 1 ? "" : "s");
+                if (g_winSaveable) dil_save();
+            }
+        } else if (winClean && !g_dilLock) {
+            /* An extreme is only real if BOTH raw eye readings are present and the
+               raw pair average is still extreme when the dwell expires; otherwise
+               the smoothed tail of one bad detection is what gets committed. */
+            int haveRaw = (raw[0] > 0.0f && raw[1] > 0.0f);
+            float rawAvg = haveRaw ? 0.5f * (raw[0] + raw[1]) : 0.0f;
+            int minReal = haveRaw && (rawAvg <= g_winMinCand + PUPIL_WINDOW_CONFIRM);
+            int maxReal = haveRaw && (rawAvg >= g_winMaxCand - PUPIL_WINDOW_CONFIRM);
             if (mm < g_minMm) {
                 if (mm < g_winMinCand - PUPIL_WINDOW_CONFIRM) { g_winMinCand = mm; g_winMinMs = now; }
                 else if (mm < g_winMinCand) g_winMinCand = mm;
-                if ((float)(now - g_winMinMs) >= PUPIL_WINDOW_DWELL_MS) g_minMm = g_winMinCand;
+                if ((float)(now - g_winMinMs) >= PUPIL_WINDOW_DWELL_MS && minReal) {
+                    g_minMm = g_winMinCand;
+                    g_winSaveable = 1;
+                    dil_save();
+                }
             } else { g_winMinCand = mm; g_winMinMs = now; }
             if (mm > g_maxMm) {
                 if (mm > g_winMaxCand + PUPIL_WINDOW_CONFIRM) { g_winMaxCand = mm; g_winMaxMs = now; }
                 else if (mm > g_winMaxCand) g_winMaxCand = mm;
-                if ((float)(now - g_winMaxMs) >= PUPIL_WINDOW_DWELL_MS) g_maxMm = g_winMaxCand;
+                if ((float)(now - g_winMaxMs) >= PUPIL_WINDOW_DWELL_MS && maxReal) {
+                    g_maxMm = g_winMaxCand;
+                    g_winSaveable = 1;
+                    dil_save();
+                }
             } else { g_winMaxCand = mm; g_winMaxMs = now; }
         }
+        dil_history(mm, winClean, now);
+        dil_heal(now);
         g_lastMm = mm;
         g_pupilAcceptMs = now;
         g_have_pupil = 1;
@@ -1026,10 +1296,14 @@ static void compute_and_send(void) {
         float wideHalf = half / fmaxf(PUPIL_DILATION_GAIN, PUPIL_GAIN_MIN);
         float lo = center - wideHalf, hi = center + wideHalf;
         /* Never emit a window that excludes the emitted pupil: VRCFT pins
-           dilation to 0 when pupil<=min and to 1 when pupil>=max. */
-        float eps = fmaxf(PUPIL_WINDOW_MARGIN, 0.05f * (hi - lo));
-        if (lo > g_lastMm - eps) lo = g_lastMm - eps;
-        if (hi < g_lastMm + eps) hi = g_lastMm + eps;
+           dilation to 0 when pupil<=min and to 1 when pupil>=max. A LOCKED window
+           is the exception: it is fixed on purpose, so pinning at the extremes is
+           the honest behaviour of a range the user chose. */
+        if (!g_dilLock) {
+            float eps = fmaxf(PUPIL_WINDOW_MARGIN, 0.05f * (hi - lo));
+            if (lo > g_lastMm - eps) lo = g_lastMm - eps;
+            if (hi < g_lastMm + eps) hi = g_lastMm + eps;
+        }
         g_lastMin = lo; g_lastMax = hi;
         tail[T_LPupil] = g_lastMm; tail[T_RPupil] = g_lastMm;
         tail[T_MinDil] = lo; tail[T_MaxDil] = hi;
@@ -1043,13 +1317,13 @@ static void compute_and_send(void) {
                diameter here is UNCLAMPED so junk is visible. open= is the EMITTED
                openness (so the wink fold shows up here), closed= the raw input,
                wb= the wink-fold boost applied to it. */
-            fprintf(stderr, "gxr_alvr: pupil mm=%.2f nd=%d min=%.2f max=%.2f open=%.2f/%.2f eye=%d%d oc=%d%d raw=%.2f/%.2f s=%.2f/%.2f closed=%.2f/%.2f wb=%.2f/%.2f det=",
+            fprintf(stderr, "gxr_alvr: pupil mm=%.2f nd=%d min=%.2f max=%.2f open=%.2f/%.2f eye=%d%d oc=%d%d raw=%.2f/%.2f s=%.2f/%.2f closed=%.2f/%.2f wb=%.2f/%.2f lk=%d det=",
                     g_lastMm, nd, g_minMm, g_maxMm, tail[T_LOpen], tail[T_ROpen],
                     eyeOpen[0], eyeOpen[1], g_eyeOccl[0], g_eyeOccl[1],
                     raw[0], raw[1], g_eyeS[0], g_eyeS[1],
                     haveFace ? g_face[F_EYES_CLOSED_L] : -1.0f,
                     haveFace ? g_face[F_EYES_CLOSED_R] : -1.0f,
-                    g_winkBoost[0], g_winkBoost[1]);
+                    g_winkBoost[0], g_winkBoost[1], g_dilLock);
             for (int i = 0; i < MAX_DET; i++) {
                 if (!g_det_ok[i]) continue;
                 float dd = 2.0f * fmaxf(g_det[i][2], g_det[i][3]) * PUPIL_MM_SCALE;
@@ -1223,19 +1497,22 @@ static int feed_line(const char *line) {
         if (eye == 0) { memcpy(g_Ldir, d, 12); g_eyedir_mask |= 1; }
         else          { memcpy(g_Rdir, d, 12); g_eyedir_mask |= 2; }
         g_eyedir_ms = now_ms();
+        g_dirty = 1;
         return 1;
     }
     if (parse_bs(line, fv) == 0) {
         memcpy(g_face, fv, sizeof(fv)); g_face_ms = now_ms();
-        compute_and_send();
+        g_dirty = 1;
         return 1;
     }
     if (parse_jaw(line, jv) == 0) {
         memcpy(g_jaw, jv, sizeof(jv)); g_jaw_ms = now_ms();
+        g_dirty = 1;
         return 1;
     }
     if (parse_tongue(line, tv) == 0) {
         memcpy(g_tongue, tv, sizeof(tv)); g_tongue_ms = now_ms();
+        g_dirty = 1;
         return 1;
     }
     if (parse_pten(line, &idx, v) == 0) {
@@ -1246,6 +1523,7 @@ static int feed_line(const char *line) {
             g_det_ok[idx] = 1;
         }
         g_pupil_ms = now_ms();
+        g_dirty = 1;
         return 1;
     }
     return 0;
@@ -1273,6 +1551,11 @@ static void usage(FILE *f, const char *argv0) {
         "  --pupil-min-conf <f> --pupil-open-gate <f> --pupil-max-jump <f>\n"
         "  --pupil-relock-ms <f>  forget an eye after this long with no reading (default 1500)\n"
         "  --pupil-smooth-ms <f>  per-eye low-pass time constant (default 350)\n"
+        "  --state-dir <path>     keep dilmin/dilmax/dillock here (supervise.sh passes the\n"
+        "                         module directory; without it the range is not persisted)\n"
+        "  --dil-min <f> --dil-max <f>\n"
+        "                         explicit dilation range (our scale, as printed by\n"
+        "                         min=/max=); locks the range and overrides the files\n"
         "  --wink-gap <f>         one-eye closure gap that counts as a wink (default\n"
         "                         0.35; 0 disables the wink fold)\n"
         "  --wink-ms <f>          how long a gated wink takes to close fully (default 200)\n"
@@ -1323,6 +1606,7 @@ int main(int argc, char **argv) {
     const char *eye_plugin = EYE_PLUGIN, *face_plugin = FACE_PLUGIN;
     int selftest = 0;
     int mirror_port = 0;
+    float cli_dil_min = 0.0f, cli_dil_max = 0.0f;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--pc") && i + 1 < argc) pc = argv[++i];
@@ -1340,6 +1624,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--pupil-max-jump") && i + 1 < argc) PUPIL_MAX_JUMP = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--pupil-relock-ms") && i + 1 < argc) PUPIL_RELOCK_MS = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--pupil-smooth-ms") && i + 1 < argc) PUPIL_SMOOTH_MS = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--state-dir") && i + 1 < argc) g_stateDir = argv[++i];
+        else if (!strcmp(argv[i], "--dil-min") && i + 1 < argc) cli_dil_min = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--dil-max") && i + 1 < argc) cli_dil_max = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--gaze-blink-shut") && i + 1 < argc) GAZE_BLINK_SHUT = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--gaze-pitch-guard") && i + 1 < argc) GAZE_PITCH_GUARD = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--gaze-lid-low") && i + 1 < argc) GAZE_LID_LOW = strtof(argv[++i], NULL);
@@ -1368,6 +1655,34 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--version")) { printf("gxr_alvr %s\n", GXR_VERSION); return 0; }
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(stdout, argv[0]); return 0; }
         else { fprintf(stderr, "gxr_alvr: unknown arg: %s\n", argv[i]); usage(stderr, argv[0]); return 2; }
+    }
+
+    /* Dilation range: the state files first, then an explicit --dil-min/--dil-max
+       override. Explicit values ARE the lock (that is the "type the numbers and
+       stick with them" path); the files are what the WebUI's Lock/Unlock writes.
+       A selftest is a socket check and must not touch the state files. */
+    if (!selftest) dil_load();
+    int cliLoOk = isfinite(cli_dil_min) && cli_dil_min > 0.0f && cli_dil_min <= 100.0f;
+    int cliHiOk = isfinite(cli_dil_max) && cli_dil_max > 0.0f && cli_dil_max <= 100.0f;
+    if (!selftest && cliLoOk && cliHiOk && cli_dil_max > cli_dil_min) {
+        g_minMm = cli_dil_min; g_maxMm = cli_dil_max;
+        g_winLoaded = 1; g_winSaveable = 1; g_seeded = 1; g_dilLock = 1;
+        g_winMinCand = g_minMm; g_winMaxCand = g_maxMm;
+        fprintf(stderr, "gxr_alvr: dilation range from the command line: %.3f..%.3f mm (locked)\n",
+                (double)g_minMm, (double)g_maxMm);
+        /* Mirror it into the state files so the WebUI shows what is actually in
+           force (values + locked) instead of "learning" while the CLI governs. */
+        if (g_stateDir) {
+            state_write_float("dilmin", g_minMm);
+            state_write_float("dilmax", g_maxMm);
+            char lk[512];
+            state_path(lk, sizeof(lk), "dillock");
+            FILE *lf = fopen(lk, "w");
+            if (lf) fclose(lf);
+        }
+    } else if (!selftest && (cli_dil_min != 0.0f || cli_dil_max != 0.0f)) {
+        fprintf(stderr, "gxr_alvr: --dil-min/--dil-max need finite values with 0 < min < max <= 100 "
+                        "and are only used together; ignoring\n");
     }
 
     /* While verbose is on, batch the tuning trace instead of one write per line:
@@ -1473,6 +1788,12 @@ int main(int argc, char **argv) {
     if (WINK_GAP > 0.0f)
         fprintf(stderr, "gxr_alvr: wink fold on (gap %.2f, %d ms ramp); --wink-gap 0 disables it\n",
                 (double)WINK_GAP, (int)WINK_MS);
+    if (g_dilLock)
+        fprintf(stderr, "gxr_alvr: dilation range locked at %.3f..%.3f mm\n",
+                (double)g_minMm, (double)g_maxMm);
+    else
+        fprintf(stderr, "gxr_alvr: dilation range learning (%s)\n",
+                g_stateDir ? "state files enabled" : "not persisted");
     /* The armed line is how "is the new binary live?" gets answered, so it has to
        reach the log now, before anything else can buffer it. */
     fflush(stderr);
@@ -1538,6 +1859,15 @@ int main(int argc, char **argv) {
             }
         }
         long long tnow = now_ms();
+        /* One recompute per COMPUTE_PERIOD_MS, not one per probe event: the probes
+           cannot deliver more than ~57 Hz of eye data, so this is the fastest rate
+           that buys anything. Deliberately independent of --tx-hz: a slow stream
+           still sends a frame that is at most 16 ms old. */
+        if (g_dirty && tnow - g_lastComputeMs >= COMPUTE_PERIOD_MS) {
+            g_dirty = 0;
+            g_lastComputeMs = tnow;
+            compute_and_send();
+        }
         g_loopTickMs = tnow;                 /* watchdog progress marker */
         if (tnow - g_lastTxMs >= tx_gap_ms()) tx_send();
 
@@ -1590,9 +1920,10 @@ int main(int argc, char **argv) {
             if (event_present("jaw")) probes++;
             if (event_present("tongue")) probes++;
             g_printStartMs = now_ms();
-            fprintf(stderr, "gxr_alvr: hb t=%lld ev=%lld tx=%lld idle=%lldms probes=%d/5 "
+            fprintf(stderr, "gxr_alvr: hb t=%lld ev=%lld tx=%lld cmp=%lld idle=%lldms probes=%d/5 "
                             "on=%d quiet=%d verbose=%d\n",
-                    tnow, g_evCount, g_txCount, g_lastDataMs ? (tnow - g_lastDataMs) : -1,
+                    tnow, g_evCount, g_txCount, g_computeCount,
+                    g_lastDataMs ? (tnow - g_lastDataMs) : -1,
                     probes, tracing_enabled(), g_quietCount, g_verbose);
             print_done();
             /* The heartbeat is the liveness proof, so it must reach the log now --
@@ -1622,6 +1953,10 @@ int main(int argc, char **argv) {
 
     close(fd);
     disarm_all();
+    /* Flush the learned dilation range on the way out: the WebUI's Lock restarts
+       the relay, and the values it freezes should be the ones this run ended with,
+       not whatever the 2 s throttle last wrote. No-op while locked. */
+    dil_save();
     close(g_sock);
     return 0;
 }

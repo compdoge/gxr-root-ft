@@ -33,6 +33,8 @@ Every setting is an optional file in the module directory. All of them are
 | `verbose` | enables the fast tuning log (see Logs). |
 | `devopts` | the WebUI's Developer-options flags, one `--flag value` per line. A **pure data file**: values are restricted to `A-Za-z0-9 . _ , : / + - =`, so nothing can escape into the shell. |
 | `dev` | opt-in dev override: prefer a binary at `/data/local/tmp/gxr_alvr` (see Dev mode). |
+| `dilmin`, `dilmax` | the learned pupil-dilation range, in our internal scale. Written by the relay as it learns, read back as the starting range on the next start. See **The dilation range**. |
+| `dillock` | marker: freezes `dilmin`/`dilmax`. Written by the WebUI **Lock** button, removed by **Unlock**. |
 | `paused` | marker: written by the WebUI **Pause** button, cleared by **Resume**. A reboot starts the relay regardless. |
 
 By hand (root):
@@ -55,7 +57,8 @@ new version. The WebUI's *Save & restart* does that for you.
 The WebUI's **Developer options** card exposes the sender's tuning knobs, each
 with a one-line description - the datagram rate (`--tx-hz`), the wink fold
 (`--wink-gap`, `--wink-ms`), the mirror port, TongueRoll gain, the dilation keys
-(`--pupil-dilation-gain`, `--pupil-smooth-ms`, `--pupil-min-conf`) and the gaze
+(`--pupil-dilation-gain`, `--pupil-smooth-ms`, `--pupil-min-conf`), the explicit
+dilation range (`--dil-min`, `--dil-max`) and the gaze
 keys. The gaze keys decide when an eye's
 direction is *trustworthy*: a pitch-guarded blink test plus a pupil test relative
 to that eye's own recent size (`--gaze-lid-low`, `--gaze-pupil-ratio`), a
@@ -83,11 +86,54 @@ squint) show no left/right gap, so nothing is folded for them - which is what ma
 this different from the old unconditional fold that used to saturate squints.
 `--wink-gap 0` disables the fold.
 
+### The dilation range
+
+VRCFT turns the pupil diameter into the 0..1 `PupilDilation` value with
+`(pupil - min) / (max - min)`, where `min`/`max` are the window this module sends
+in every frame - not a fixed physiological range. That window therefore decides
+how much of the avatar's dilation range your eyes actually use: a wide fixed band
+(a real pupil only moves about 3-5 mm) looks weak, while a window fitted to your
+own eyes uses most of the range.
+
+The relay learns the window from frames it can trust (both eyes reading, both
+lids clearly open). Since v1.3.11 it seeds from the median of the first 8 clean
+frames instead of one frame, remembers the window across restarts
+(`dilmin`/`dilmax`), only commits a new extreme when both raw readings still match
+it, and slowly heals an extreme that has not been approached for ten minutes (and
+only while your recent pupil swing is at least 0.5 mm, so sitting still in steady
+light cannot collapse the range).
+
+Once the range has settled, **Lock** freezes it - that is the recommended state,
+because it stops a stray reading or a lighting change from squeezing the range
+mid-session. **Reset** forgets it and learns again from scratch (it stops the relay
+first, so the range cannot be written back on the way out). A locked window that is
+narrower than your pupils in very bright or very dark light will leave the avatar's
+pupils at 0 or 1 at the extremes: that is the honest behaviour of a fixed range, so
+Unlock or Reset if you want it to adapt again.
+
+The numbers are our internal scale, not true millimetres (the scale cancels inside
+VRCFT because the window is sent along with the diameter). They are the *learned
+envelope*: the window VRCFT actually receives is 1 / `--pupil-dilation-gain` wider
+(33% wider at the default 0.75), so copying the shown numbers reproduces the
+current behaviour rather than narrowing it. Copy them from the WebUI or from
+`min=`/`max=` in the verbose log.
+
+To skip calibration entirely, type a min and max into the Dilation card and press
+**Use these values**: it writes both files, locks the range and restarts the relay.
+The `--dil-min` / `--dil-max` developer options do the same thing from the command
+line; either way the explicit pair outranks the learned files (Unlock/Reset refuse
+to pretend otherwise while it is set).
+
 A field left at its default is omitted, so future default changes still reach you;
 **Reset to defaults** clears the file. PC IP, UDP port, TongueRoll and Verbose have
 their own controls in the **Connection** card above.
 
 ## Pause / Resume / Export logs (WebUI)
+
+The page refreshes itself every 10 seconds while it is visible and immediately when
+you return to it, so the status, the log tail and the dilation range stay current
+without a reload. It pauses while you are typing in a field and while an action is
+running.
 
 The status card has three buttons:
 
@@ -139,8 +185,8 @@ shipped users.)
 | `service.sh` | boot / late-load start |
 | `action.sh` | Manager Action button = restart now |
 | `supervise.sh` | reads the option files and runs the relay under a respawn supervisor; called by both of the above |
-| `webui.sh` | helper for the Manager WebUI page (status / set / setdev / pause / resume / exportlog / test) |
-| `webroot/index.html` | the Manager WebUI page (PC IP, status, Pause/Resume, log export, log tail, Developer options) |
+| `webui.sh` | helper for the Manager WebUI page (status / set / setdev / dilcal / pause / resume / exportlog / test) |
+| `webroot/index.html` | the Manager WebUI page (PC IP, status, dilation range, Pause/Resume, log export, log tail, Developer options) |
 | `customize.sh` | installer permissions + ui_print |
 | `uninstall.sh` | stop the relay on uninstall |
 | `sepolicy.rule` | allow the KernelSU root domain to use tracefs (Enforcing) |
@@ -155,8 +201,12 @@ run is kept as `gxr_alvr.log.1`). The relay also logs `armed ...` / `auto target
 stall is visible even when nothing is arriving:
 
 ```
-gxr_alvr: hb t=<ms> ev=<probe events> tx=<datagrams> idle=<ms since last event> probes=<n>/5 on=<1|0> quiet=<n> verbose=<1|0>
+gxr_alvr: hb t=<ms> ev=<probe events> tx=<datagrams> cmp=<frames computed> idle=<ms since last event> probes=<n>/5 on=<1|0> quiet=<n> verbose=<1|0>
 ```
+
+`cmp` counts recomputes of the outgoing frame. Since v1.3.11 that should track
+`tx` (about 60/s at the default rate) rather than `ev`; before v1.3.11 it
+followed the ~15 Hz expression events.
 
 `idle` climbing while `ev` stands still means the device is not feeding us;
 `ev` still climbing but `tx` frozen would mean the transmit side is wedged; no
@@ -176,8 +226,9 @@ not fix the one case it cannot see (a foreign `trace_pipe` consumer) anyway.
 `verbose` adds the tuning trace (~20 Hz gaze, 4 Hz pupil). Its lines carry what a
 field capture needs to explain an eye: `open=` is the EMITTED openness (so the
 wink fold is visible), `closed=` the raw sensor value and `wb=` the wink-fold
-boost applied to it, `held=` the gaze trust gate and `pu=` the pupil size relative
-to that eye's own baseline. The trace is batch-written and flushed at least on
+boost applied to it, `held=` the gaze trust gate, `pu=` the pupil size relative
+to that eye's own baseline, and `lk=1` marks a locked dilation range (`min=` and
+`max=` are the learned envelope). The trace is batch-written and flushed at least on
 every heartbeat; past 4 MB in a single run, verbose switches itself off and the
 heartbeat slows to every 5 minutes, so a long run cannot grow the log without
 bound. If single log writes start taking more than a second - a busy filesystem -
@@ -190,6 +241,13 @@ parses the events they emit. In a real session (Virtual Desktop + VRChat) those 
 probes together fire about **330 times a second** - roughly 4.6 per frame at
 72 Hz - and the relay parses them and sends ~50-60 datagrams/s. That is the whole
 cost, and it does not depend on how many PC-side modules read the stream.
+
+Since v1.3.11 the relay recomputes the outgoing frame every 16 ms instead of once
+per expression event, so at the default 60 Hz transmit rate gaze and pupil reach
+the PC at their own ~57 Hz / ~42 Hz. A slower `--tx-hz` sends fewer datagrams, but
+each one is still computed within 16 ms of the data it carries. The expression
+values themselves still change only at the vendor's ~15 Hz - that limit is
+upstream, not in the relay.
 
 Idle is deliberately much cheaper than active: once no probe event has arrived for
 1 s the relay drops to a 10 Hz loop and a 10 Hz keepalive (still sending a relaxed

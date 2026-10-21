@@ -15,7 +15,7 @@ set_perm $MODPATH/uninstall.sh 0 0 0755
 OLD=/data/adb/modules/gxr-alvr
 KEPT=
 if [ -n "$MODPATH" ] && [ -d "$MODPATH" ] && [ -d "$OLD" ]; then
-  for f in pc port mirror tongue verbose dev devopts; do
+  for f in pc port mirror tongue verbose dev devopts dilmin dilmax dillock; do
     if [ -f "$OLD/$f" ] && [ ! -e "$MODPATH/$f" ]; then
       cp -af "$OLD/$f" "$MODPATH/$f" 2>/dev/null && KEPT="$KEPT $f"
     fi
