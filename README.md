@@ -181,15 +181,29 @@ module's WebUI never shows. Use `tools/make_module_zip.py` (writes `/` explicitl
 or POSIX `zip`.
 
 The bundled binary is committed so users can install without a toolchain; if you
-change `headset/gxr_alvr.c`, rebuild and re-copy it.
+change `headset/gxr_alvr.c`, rebuild and re-copy it into `ksu-module/gxr-alvr/`.
+The `armed` line in the log prints the binary's own version, so it is the proof
+that the rebuilt binary is the one running.
 
 ### Notes
 
 - Uprobe offsets are **firmware-specific** (developed on Galaxy XR `SM-I610`,
-  firmware `I610UEU2AZF3`); the sender fails soft per probe if the firmware
-  changes.
+  firmware `I610UEU2AZF3`); the four optional probes fail soft, while the pupil
+  probe (`pten`) is mandatory and an arm failure exits `rc=3`.
 - The sender refuses to start a second copy (`flock`) and self-heals if tracefs is
-  cleared under it.
+  cleared under it. A read failure is reported as unknown, never as missing
+  probes; clearing the device-wide uprobe set (which also drops other tools'
+  probes) needs three consecutive confirmed misses of a probe this run had
+  armed - the startup set is the baseline, so an optional probe that never armed
+  cannot trigger a re-arm loop - with a 30 s floor counted from startup that
+  backs off up to 10 minutes while re-arms keep failing, and at most 5 failed
+  attempts before it stops and waits for an explicit restart. A main-loop gap
+  longer than 15 s is logged as
+  "not scheduled or was blocked ... resuming" and the relay keeps running (its
+  probes and learned range survive); a 5-15 s gap is treated as a real loop
+  stall and still exits for the supervisor to restart. The log also records the
+  process's parent chain, cgroup and `oom_score_adj`, so an exported log shows
+  whether a start ran in the Manager's app context or at boot.
 - If something **outside** the module kills the relay (`rc=137`, usually the
   low-memory killer), the supervisor does not restart it: it logs why and stops,
   and you start it again from the Manager **Action** button or the WebUI. Putting

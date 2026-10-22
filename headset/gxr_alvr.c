@@ -61,7 +61,7 @@
 
 /* Reported in the startup log and by --version, so the running build is always
    identifiable (avoids "is the new binary actually live?" confusion). */
-#define GXR_VERSION "1.3.11"
+#define GXR_VERSION "1.3.12"
 
 #define TRACE "/sys/kernel/tracing"
 /* Per-CPU trace ring buffer. The probes fire about 330 times a second, which is
@@ -444,6 +444,94 @@ static int acquire_lock(void) {
     return fd;      /* keep the fd open for the process lifetime */
 }
 
+/* ---------------- startup process context ----------------
+   Which parent/cgroup did this start inherit? The same binary runs either from
+   the module service at boot (ksud/init context) or from action.sh/webui.sh in
+   the Manager (the app's cgroup), and only the second is tied to an app that
+   Android may freeze when it goes cached. The log used to record neither, so an
+   exported log could not answer that question without adb. This prints one
+   bounded line at startup.
+
+   Safety: only kernel identity fields are read - no environment, no argv, no
+   tokens or pairing data. Every field is read into a fixed buffer, cut at the
+   first newline, length-capped, and non-printable bytes become '?', so a strange
+   procfs value can neither forge a log line nor make the output unbounded. Any
+   read failure prints "unknown" and the start continues. */
+#define DIAG_FIELD 96
+
+static int read_diag_field(const char *path, char *out, size_t cap) {
+    out[0] = '\0';
+    if (cap < 2) return -1;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    ssize_t n = read(fd, out, cap - 1);
+    close(fd);
+    if (n <= 0) { out[0] = '\0'; return -1; }
+    out[n] = '\0';
+    out[strcspn(out, "\r\n")] = '\0';
+    for (char *p = out; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c < 0x20 || c > 0x7e) *p = '?';
+    }
+    return 0;
+}
+
+/* PPID out of /proc/<pid>/stat. The comm field may contain spaces and ')',
+   so split at the LAST ')' instead of tokenizing from the start. */
+static int read_stat_ppid(const char *path) {
+    char b[512];
+    if (read_diag_field(path, b, sizeof(b)) != 0) return -1;
+    char *rp = strrchr(b, ')');
+    if (!rp || rp[1] != ' ') return -1;
+    char state = 0;
+    int ppid = -1;
+    if (sscanf(rp + 2, "%c %d", &state, &ppid) != 2) return -1;
+    return ppid;
+}
+
+static void log_process_context(void) {
+    int ppid = read_stat_ppid("/proc/self/stat");
+    char parent[DIAG_FIELD] = "unknown";
+    char chain[192] = "unknown";
+    char cgroup[192] = "unknown";
+    char oom[32] = "unknown";
+
+    if (ppid > 0) {
+        char p[64];
+        snprintf(p, sizeof(p), "/proc/%d/comm", ppid);
+        if (read_diag_field(p, parent, sizeof(parent)) != 0)
+            snprintf(parent, sizeof(parent), "unknown");
+        /* Up to four ancestors, nearest first (a boot start looks like
+           "sh<sh<ksud<init"; a Manager start shows the app instead of ksud).
+           Each hop is bounded and stops on an unreadable /proc entry or pid loop. */
+        size_t used = 0;
+        chain[0] = '\0';
+        int pid = ppid;
+        for (int hop = 0; hop < 4 && pid > 1; hop++) {
+            char cp[64], comm[DIAG_FIELD], sp[64];
+            snprintf(cp, sizeof(cp), "/proc/%d/comm", pid);
+            if (read_diag_field(cp, comm, sizeof(comm)) != 0) break;
+            /* Compose the hop first and commit only if it fits whole: a
+               half-truncated process name would be misleading in a diagnostic. */
+            char hop[DIAG_FIELD + 2];
+            int w = snprintf(hop, sizeof(hop), "%s%s", used ? "<" : "", comm);
+            if (w < 0 || (size_t)w >= sizeof(chain) - used) break;
+            memcpy(chain + used, hop, (size_t)w + 1);
+            used += (size_t)w;
+            snprintf(sp, sizeof(sp), "/proc/%d/stat", pid);
+            int next = read_stat_ppid(sp);
+            if (next <= 0 || next == pid) break;
+            pid = next;
+        }
+        if (!chain[0]) snprintf(chain, sizeof(chain), "%s", parent);
+    }
+    read_diag_field("/proc/self/cgroup", cgroup, sizeof(cgroup));
+    read_diag_field("/proc/self/oom_score_adj", oom, sizeof(oom));
+    fprintf(stderr, "gxr_alvr: process: pid=%d ppid=%d parent=%s chain=%s cgroup=%s oom_score_adj=%s\n",
+            (int)getpid(), ppid, parent, chain, cgroup, oom);
+    fflush(stderr);   /* verbose buffering is already active at this point */
+}
+
 /* Gaze mapping: VRCFT's Gaze.x is HORIZONTAL, Gaze.y VERTICAL. Device frame is
    +x right, +y DOWN, +z forward, so yaw = atan2(x,z) (+ = look right) and
    pitch = atan2(-yDown,z) (+ = look up). Defaults (swap=0, no inversion) send
@@ -460,17 +548,91 @@ static void gaze_map(const float d[3], float *gx, float *gy) {
 
 /* ---- self-heal: something else (a capture script / another tool) may clear
    the tracefs event set or drop tracing_on. Re-arm so the live link survives. */
-static int event_present(const char *name) {
+/* One open and a streamed read loop over uprobe_events, looking only for our
+   five event names. Reading that seq_file takes the global tracefs event_mutex
+   (trace_dynevent.c dyn_event_seq_start), which is also held while any probe
+   anywhere is created or destroyed - an uninterruptible wait that can outlast
+   the watchdog timer. Callers must therefore run inside the guarded maintenance
+   window (g_maint) or before the watchdog is armed; the heartbeat only reads the
+   cached result.
+
+   The list is parsed incrementally: chunk boundaries are handled with a small
+   carry, so the file size does not matter and there is no "oversized" case to
+   confuse with a read error. Return value is two-state and truthful:
+     -1  the list could not be read (open/read error): state UNKNOWN, which is
+         NOT the same as missing and never justifies clearing anything;
+      0  mask filled with the probes the file actually shows (0..5 bits).
+   read() is retried on EINTR: a signal arriving mid-read must not be reported
+   as a missing probe (that would clear every uprobe on the device). */
+#define PROBE_N 5
+#define PROBE_BIT(i) (1u << (i))
+#define PROBE_ALL ((1u << PROBE_N) - 1)
+#define PROBE_PTEN PROBE_BIT(0)      /* mandatory: arm failure exits rc=3 */
+#define PROBE_CARRY 64               /* > longest key ("uprobes/tongue " is 15) */
+static int probe_snapshot(unsigned *mask) {
+    if (mask) *mask = 0;
     int fd = open(TRACE "/uprobe_events", O_RDONLY);
-    if (fd < 0) return 0;
-    static char b[16384];
-    ssize_t n = read(fd, b, sizeof(b) - 1);
+    if (fd < 0) return -1;
+    static const char *names[PROBE_N] = { "pten", "dir", "bs", "jaw", "tongue" };
+    char key[PROBE_N][24];
+    for (int i = 0; i < PROBE_N; i++)
+        snprintf(key[i], sizeof(key[i]), "uprobes/%s ", names[i]);
+    unsigned found = 0;
+    char buf[4096 + PROBE_CARRY + 1];
+    size_t carry = 0;
+    int failed = 0;
+    for (;;) {
+        ssize_t n = read(fd, buf + carry, sizeof(buf) - 1 - carry);
+        if (n > 0) {
+            size_t len = carry + (size_t)n;
+            buf[len] = '\0';
+            for (int i = 0; i < PROBE_N; i++)
+                if (!(found & PROBE_BIT(i)) && strstr(buf, key[i]) != NULL)
+                    found |= PROBE_BIT(i);
+            size_t keep = (len < PROBE_CARRY) ? len : PROBE_CARRY;
+            memmove(buf, buf + len - keep, keep);
+            carry = keep;
+            continue;
+        }
+        if (n == 0) break;                                  /* EOF */
+        if (errno == EINTR) continue;                       /* signal, not a result */
+        failed = 1;
+        break;
+    }
     close(fd);
-    if (n <= 0) return 0;
-    b[n] = 0;
-    char key[64];
-    snprintf(key, sizeof(key), "uprobes/%s ", name);
-    return strstr(b, key) != NULL;
+    if (failed) return -1;
+    if (mask) *mask = found;
+    return 0;
+}
+static int probe_count(unsigned mask) {
+    int c = 0;
+    for (int i = 0; i < PROBE_N; i++) if (mask & PROBE_BIT(i)) c++;
+    return c;
+}
+/* The required set comes from what the arm calls actually returned, never from
+   the event-list snapshot: an optional probe can be armed successfully even if a
+   later verification read fails, and it must still be recovered when it
+   disappears. pten is mandatory (startup exits if its arm fails), but it is
+   included by the same rule so there is one source of truth. Argument order is
+   the bit order: pten, eyedir, face, jaw, tongue. 0 = that arm succeeded. */
+static unsigned probe_mask_from_arms(int pten, int eyedir, int face, int jaw, int tongue) {
+    unsigned m = 0;
+    if (pten == 0) m |= PROBE_PTEN;
+    if (eyedir == 0) m |= PROBE_BIT(1);
+    if (face == 0) m |= PROBE_BIT(2);
+    if (jaw == 0) m |= PROBE_BIT(3);
+    if (tongue == 0) m |= PROBE_BIT(4);
+    return m;
+}
+/* 1/0 = tracing_on value, -1 = could not read it. */
+static int tracing_enabled(void) {
+    char c = 0;
+    int f = open(TRACE "/tracing_on", O_RDONLY);
+    if (f < 0) return -1;
+    ssize_t n = read(f, &c, 1);
+    close(f);
+    if (n != 1) return -1;
+    return c == '1';
 }
 static void re_arm(void) {
     tracefs_cleanup();
@@ -481,32 +643,237 @@ static void re_arm(void) {
     arm_jaw(g_face_plugin, g_jaw_off);
     arm_tongue(g_face_plugin, g_tongue_off);
     write_file(TRACE "/tracing_on", "1\n");
-    fprintf(stderr, "gxr_alvr: re-armed (our probe set had been changed under us)\n");
+    /* Report what is actually there afterwards, not what we asked for. */
+    unsigned have = 0;
+    int snap = probe_snapshot(&have);
+    int on = tracing_enabled();
+    if (snap < 0)
+        fprintf(stderr, "gxr_alvr: re-armed (a required probe had disappeared); "
+                        "verification read failed, state unknown\n");
+    else
+        fprintf(stderr, "gxr_alvr: re-armed (a required probe had disappeared); "
+                        "verified %d/5 probes, tracing_on=%d\n",
+                probe_count(have), on);
 }
-static int tracing_enabled(void) {
-    char c = 0;
-    int f = open(TRACE "/tracing_on", O_RDONLY);
-    if (f >= 0) { if (read(f, &c, 1) < 0) c = 0; close(f); }
-    return c == '1';
+/* Cached tracefs health view, written only by health_check() (inside the
+   g_maint-guarded maintenance window) and once at startup before the watchdog
+   is armed. The heartbeat prints this instead of reading the event list itself:
+   that read serialises on the global tracefs event_mutex, so an unprotected
+   heartbeat is itself a stall path. -1 means UNKNOWN (not measured, or the read
+   failed), never "healthy". Staleness is bounded by SOCK_POLL_MS (one health
+   period) and the heartbeat prints that age, so the line never claims to be a
+   real-time reading. */
+static int g_hcProbes = -1;          /* probes present 0..5, -1 = unknown */
+static int g_hcBase = -1;            /* probes this run requires, -1 = unknown */
+static int g_hcOn = -1;              /* tracing_on 1/0, -1 = unknown */
+static long long g_hcMs;
+static unsigned g_hcBaseMask;        /* required probe bits for this run */
+static int g_hcMiss;                 /* consecutive confirmed misses of a required probe */
+static long long g_lastRearmMs;      /* last destructive re-arm (rate limit) */
+static int g_rearmFails;             /* consecutive re-arms that did not restore the set */
+static int g_rearmGaveUp;            /* told the log that automatic re-arm stopped */
+static int g_hcReadWarned;           /* one line per unreadable-event-list episode */
+static int g_hcOnWarned;             /* one line per unreadable-tracing_on episode */
+#define HC_CONFIRM_MISS 3            /* successful reads that miss before re-arming */
+#define REARM_MIN_MS 30000           /* first re-arm floor; backs off on failure */
+#define REARM_MAX_MS 600000          /* ...up to this, so a bad offset cannot churn */
+#define REARM_MAX_FAILS 5            /* ...then stop; only a restart retries */
+/* health_check result bits (the quiet-episode line reports them truthfully). */
+#define HC_PROBES_OK        1
+#define HC_PROBES_SUSPECT   2
+#define HC_PROBES_UNKNOWN   4
+#define HC_REARMED          8
+#define HC_TRACING_FIXED   16
+#define HC_TRACING_UNKNOWN 32
+#define HC_TRACING_FAILED  64
+#define HC_REARM_GAVEUP   128
+
+/* Re-arm pacing kept as small helpers so the startup floor and the backoff can
+   be unit-tested without tracefs. last==0 is only the pre-startup default; the
+   real start sets it at the initial tracefs cleanup. */
+static long long rearm_backoff_ms(int fails) {
+    long long b = REARM_MIN_MS;
+    for (int i = 0; i < fails && b < REARM_MAX_MS; i++) b *= 2;
+    return b > REARM_MAX_MS ? REARM_MAX_MS : b;
 }
+static int rearm_allowed(long long now, long long last, int fails) {
+    return last == 0 || now - last >= rearm_backoff_ms(fails);
+}
+
 static int health_check(void) {
-    /* If any of our events vanished (something truncated uprobe_events),
-       re-create the whole set. Otherwise, if only tracing_on was toggled,
-       just turn it back on -- this avoids destroying a capture tool's own
-       probes when ours are still intact.
-       Returns 1 if it had to fix something, 0 if tracefs already matched what we
-       armed. The quiet-episode report in the loop keys off this: see there. */
-    if (!event_present("pten") || !event_present("dir") ||
-        !event_present("bs") || !event_present("jaw") || !event_present("tongue")) {
-        re_arm();
-        return 1;
+    /* The expected probe set is the one this run ACTUALLY armed at startup
+       (g_hcBaseMask), not a fixed 5/5: an optional probe whose uprobe could not
+       be created is absent for the whole run, and treating that as a fault
+       would clear every uprobe on the device every backoff period for no gain.
+       A probe that failed to arm is therefore only retried by an explicit
+       restart (Action/Resume/boot), which re-arms the full set from scratch.
+       pten is mandatory: if its arm fails, startup exits rc=3.
+
+       Recovery still works when a probe that WAS armed disappears: the missing
+       bit is confirmed by HC_CONFIRM_MISS consecutive successful reads, then the
+       whole set is rebuilt once (rate-limited by REARM_MIN_MS, backing off to
+       REARM_MAX_MS while rebuilds keep failing). tracing_on is handled
+       separately and only re-enabled when it can be verified afterwards.
+
+       Safety rules that matter more than a fast recovery:
+       - a read FAILURE is unknown state, never a reason to clear anything;
+       - clearing uprobe_events drops EVERY uprobe on the device, so it needs
+         confirmed evidence and never runs on a read error.
+       This is the ONLY place in the loop that samples tracefs: the heartbeat
+       reports the cached snapshot instead of reaching into it itself. */
+    int flags = 0;
+    unsigned mask = 0;
+    int maskKnown = 0;
+    int snap = probe_snapshot(&mask);
+    long long now = now_ms();
+
+    if (snap < 0) {
+        g_hcMiss = 0;
+        flags |= HC_PROBES_UNKNOWN;
+        if (!g_hcReadWarned) {
+            g_hcReadWarned = 1;
+            fprintf(stderr, "gxr_alvr: could not read uprobe_events; probe state unknown "
+                            "(not re-arming on a read failure)\n");
+        }
+    } else {
+        maskKnown = 1;
+        g_hcReadWarned = 0;
+        unsigned missing = g_hcBaseMask & ~mask;
+        if (missing) {
+            if (g_hcMiss < 32000) g_hcMiss++;
+            flags |= HC_PROBES_SUSPECT;
+            if (g_rearmFails >= REARM_MAX_FAILS) flags |= HC_REARM_GAVEUP;
+        } else {
+            g_hcMiss = 0;
+            g_rearmFails = 0;
+            g_rearmGaveUp = 0;
+            flags |= HC_PROBES_OK;
+        }
+        /* Re-arm floor backs off while rebuilds keep failing: with a bad
+           firmware offset, a 30 s retry forever would clear other tools'
+           uprobes on every pass. */
+        if (missing && g_hcMiss >= HC_CONFIRM_MISS && g_rearmFails < REARM_MAX_FAILS &&
+            rearm_allowed(now, g_lastRearmMs, g_rearmFails)) {
+            unsigned required = g_hcBaseMask;
+            unsigned after = 0;
+            re_arm();
+            g_lastRearmMs = now_ms();
+            int asnap = probe_snapshot(&after);
+            g_hcMiss = 0;
+            flags = HC_REARMED;
+            if (asnap < 0) {
+                maskKnown = 0;
+                if (g_rearmFails < 32000) g_rearmFails++;
+                flags |= HC_PROBES_UNKNOWN;
+            } else {
+                mask = after;
+                maskKnown = 1;
+                /* Never forget a probe this run already had: a later loss of a
+                   newly restored probe must be recoverable too. */
+                g_hcBaseMask |= after;
+                if ((required & ~after) == 0) {
+                    flags |= HC_PROBES_OK;
+                    g_rearmFails = 0;
+                } else {
+                    flags |= HC_PROBES_SUSPECT;
+                    if (g_rearmFails < 32000) g_rearmFails++;
+                }
+            }
+            if (g_rearmFails >= REARM_MAX_FAILS && !g_rearmGaveUp) {
+                g_rearmGaveUp = 1;
+                flags |= HC_REARM_GAVEUP;
+                fprintf(stderr, "gxr_alvr: automatic re-arm disabled after %d failed attempts; "
+                                "a required probe is still missing (restart the relay to retry)\n",
+                        g_rearmFails);
+            }
+        }
     }
-    if (!tracing_enabled()) {
+
+    int on = tracing_enabled();
+    if (on == 0) {
         write_file(TRACE "/tracing_on", "1\n");
-        fprintf(stderr, "gxr_alvr: tracing_on had been cleared; re-enabled\n");
-        return 1;
+        int after = tracing_enabled();
+        if (after == 1) {
+            fprintf(stderr, "gxr_alvr: tracing_on had been cleared; re-enabled (verified)\n");
+            flags |= HC_TRACING_FIXED;
+            g_hcOnWarned = 0;
+        } else {
+            /* Do not claim a repair that was not verified. One line per
+               episode: this state is retried every health period. */
+            if (!g_hcOnWarned) {
+                g_hcOnWarned = 1;
+                if (after == 0)
+                    fprintf(stderr, "gxr_alvr: tracing_on had been cleared and re-enabling "
+                                    "did not stick (still 0)\n");
+                else
+                    fprintf(stderr, "gxr_alvr: tracing_on had been cleared; re-enable could "
+                                    "not be verified (read failed)\n");
+            }
+            flags |= HC_TRACING_FAILED;
+        }
+        on = after;
+    } else if (on < 0) {
+        flags |= HC_TRACING_UNKNOWN;
+        if (!g_hcOnWarned) {
+            g_hcOnWarned = 1;
+            fprintf(stderr, "gxr_alvr: tracing_on could not be read; leaving it alone\n");
+        }
+    } else {
+        g_hcOnWarned = 0;
     }
-    return 0;
+
+    g_hcProbes = maskKnown ? probe_count(mask) : -1;
+    g_hcBase = probe_count(g_hcBaseMask);
+    g_hcOn = on;
+    g_hcMs = now_ms();
+    return flags;
+}
+
+/* One line that says what the health check actually established - not more.
+   Probe state and tracing_on state are reported independently: "probes are
+   present" is only ever said when that was verified, never inferred from a
+   tracing_on read or from an unknown snapshot. */
+static void hc_verdict(int flags, char *out, size_t n) {
+    int probesBad = flags & (HC_PROBES_SUSPECT | HC_PROBES_UNKNOWN);
+    int tracingProblem = flags & (HC_TRACING_FIXED | HC_TRACING_FAILED | HC_TRACING_UNKNOWN);
+    if (!probesBad && !tracingProblem && !(flags & HC_REARMED)) {
+        snprintf(out, n, "healthy, so this is idle rather than a fault");
+        return;
+    }
+
+    char a[128], b[96];
+    a[0] = b[0] = '\0';
+    if ((flags & HC_REARMED) && probesBad && (flags & HC_REARM_GAVEUP))
+        snprintf(a, sizeof(a), "our probe set had been changed, a re-arm did not restore it, "
+                               "and automatic re-arming has stopped");
+    else if ((flags & HC_REARMED) && probesBad)
+        snprintf(a, sizeof(a), "our probe set had been changed and a re-arm did not restore it");
+    else if (flags & HC_REARMED)
+        snprintf(a, sizeof(a), "our probe set had been changed; re-armed it");
+    else if (flags & HC_REARM_GAVEUP)
+        snprintf(a, sizeof(a), "a required probe is still missing and automatic re-arming "
+                               "has stopped; restart the relay to retry");
+    else if (flags & HC_PROBES_SUSPECT)
+        snprintf(a, sizeof(a), "the event list is missing some of our probes; %d consecutive "
+                               "confirmations are needed before re-arming", HC_CONFIRM_MISS);
+    else if (flags & HC_PROBES_UNKNOWN)
+        snprintf(a, sizeof(a), "probe state could not be verified just now");
+    else
+        snprintf(a, sizeof(a), "our probes are present");
+
+    if (flags & HC_TRACING_FIXED)
+        snprintf(b, sizeof(b), "tracing_on had been cleared and has been re-enabled");
+    else if (flags & HC_TRACING_FAILED)
+        snprintf(b, sizeof(b), "tracing_on had been cleared and could not be re-enabled");
+    else if (flags & HC_TRACING_UNKNOWN)
+        snprintf(b, sizeof(b), "tracing_on could not be read");
+
+    if (b[0] && a[0])
+        snprintf(out, n, "%s; %s", a, b);
+    else if (b[0])
+        snprintf(out, n, "%s", b);
+    else
+        snprintf(out, n, "%s", a);
 }
 
 /* ---------------- parsing ---------------- */
@@ -773,6 +1140,19 @@ static int tx_period_ms(void) {
 #define HB_SLOW_MS 300000               /* ...and once the log has passed the cap */
 #define QUIET_MS 3000                   /* no OUR-probe event for this long = quiet */
 #define WATCHDOG_MS 5000                /* no main-loop progress this long -> exit */
+/* A gap this much longer than WATCHDOG_MS is not "a slow loop": the timer
+   handler runs only after the process is back in user mode, so a gap of this
+   size means it was not scheduled at all (stopped, frozen by an app-cgroup
+   policy, or parked in the kernel). Restarting in that case throws away a
+   healthy tracefs set and can land in the same state again, so the watchdog
+   records the gap and resumes; only a gap between WATCHDOG_MS and this is
+   treated as a real loop stall. The mechanism behind a long gap is NOT known
+   from the log alone, so the message does not name one. */
+#define LONG_GAP_MS (3 * WATCHDOG_MS)
+/* Tracefs maintenance is exempt from the watchdog (a mid-operation kill is how
+   a kill/restart loop starts), but silence must not be unbounded either: after
+   this long the handler logs ONE line saying maintenance has not returned. */
+#define MAINT_WARN_MS (3 * WATCHDOG_MS)
 #define LOG_CAP_BYTES (4 * 1024 * 1024) /* verbose switches itself off past this */
 /* Idle dormancy. When nothing feeds the probes (no app is asking for tracking)
    there is nothing to parse and nothing new to send, so the loop only has to
@@ -786,10 +1166,15 @@ static int tx_period_ms(void) {
 #define IDLE_POLL_MS 100                /* dormant loop period (10 wakeups/s) */
 #define IDLE_TX_HZ 10                   /* dormant keepalive datagrams/s */
 static volatile long long g_loopTickMs;  /* last main-loop progress (watchdog) */
+static volatile sig_atomic_t g_longGaps; /* long no-progress gaps survived (see on_alarm) */
 #define PRINT_SLOW_MS 1000              /* one log write longer than this is a stall */
 #define PRINT_SLOW_MAX 3                /* ...this many and verbose turns itself off */
 static long long g_printStartMs;        /* when the current log write started */
 static int g_printSlow;                 /* log writes that took too long */
+/* Set by the watchdog handler after it survives a long gap, so that gap is not
+   mistaken for a slow log write. The handler must not write the 64-bit marker
+   itself (the main loop writes it too); the main loop applies this flag. */
+static volatile sig_atomic_t g_printReset;
 
 /* A completed log write counts as loop progress. A filesystem hiccup must not
    look like a wedged relay: the watchdog would restart the relay, and restarting
@@ -799,6 +1184,15 @@ static int g_printSlow;                 /* log writes that took too long */
    stuck, so a syscall that never returns still trips the watchdog. */
 static void print_done(void) {
     long long now = now_ms();
+    if (g_printReset) {
+        /* A long no-progress gap was just survived; it was not this log write
+           being slow. Clear the flag here as well as in the loop so the first
+           write after the gap cannot be misjudged. */
+        g_printReset = 0;
+        g_printStartMs = now;
+        g_loopTickMs = now;
+        return;
+    }
     long long d = g_printStartMs ? (now - g_printStartMs) : 0;
     g_loopTickMs = now;
     g_printStartMs = now;
@@ -813,6 +1207,8 @@ static void print_done(void) {
     }
 }
 static volatile sig_atomic_t g_maint;   /* a tracefs maintenance op is running */
+static volatile long long g_maintStartMs;    /* when the current maintenance began */
+static volatile sig_atomic_t g_maintWarned;  /* already said it has not returned */
 static long long g_evCount;             /* OUR probe events parsed */
 static long long g_txCount;             /* datagrams sent */
 static long long g_computeCount;        /* frames computed (should track the tx rate) */
@@ -1577,24 +1973,82 @@ static void usage(FILE *f, const char *argv0) {
         argv0);
 }
 
-/* Watchdog. The loop cannot notice its own stall, so the timer does: if the main
-   loop has not progressed for WATCHDOG_MS, log it and exit. Exiting is the right
-   recovery because the module runs the relay under a supervisor that starts it
-   again -- a frozen relay helps nobody and the PC only sees a short gap.
+/* Watchdog. The loop cannot notice its own stall, so the timer does. Two cases:
+   - a gap just over WATCHDOG_MS: the loop is alive enough to take the signal but
+     has stopped making progress (a wedged userspace path or a blocked syscall).
+     Exit so the supervisor can restart it.
+   - a gap over LONG_GAP_MS: the handler only runs once the process is back in
+     user mode, so this means it was not running at all for that long (an app
+     cgroup freezer, SIGSTOP, or an uninterruptible kernel wait - the log cannot
+     say which, so the message does not). Exiting would rebuild every uprobe and
+     discard the dilation range, and if the cause is still active the replacement
+     lands in the same state. Record the gap, reset the markers and carry on: the
+     loop resumes exactly where it was, and a genuine userspace spin still trips
+     the first branch within WATCHDOG_MS of that reset.
    Deliberate maintenance is exempt (g_maint): arming or clearing uprobes makes
    the kernel synchronise RCU and can sit on a tracefs write for a while, and
    killing the relay because it was legitimately maintaining tracefs is how a
    kill/restart loop starts.
-   Async-signal-safe only: clock_gettime, write, _exit. */
+   Async-signal-safe only: clock_gettime, write, _exit (the tiny formatting below
+   uses no stdio). */
+static size_t put_str(char *b, size_t cap, size_t at, const char *s) {
+    while (*s && at + 1 < cap) b[at++] = *s++;
+    return at;
+}
+static size_t put_ll(char *b, size_t cap, size_t at, long long v) {
+    char tmp[24];
+    int n = 0;
+    unsigned long long u = (v < 0) ? (unsigned long long)(-v) : (unsigned long long)v;
+    do { tmp[n++] = (char)('0' + (int)(u % 10)); u /= 10; } while (u && n < (int)sizeof(tmp));
+    if (v < 0) tmp[n++] = '-';
+    while (n > 0 && at + 1 < cap) b[at++] = tmp[--n];
+    return at;
+}
 static void on_alarm(int s) {
     (void)s;
-    if (g_maint) return;                              /* maintenance, not a stall */
-    if (now_ms() - g_loopTickMs > WATCHDOG_MS) {
-        static const char msg[] = "gxr_alvr: watchdog: main loop stalled; exiting so the supervisor can restart\n";
-        ssize_t w = write(2, msg, sizeof(msg) - 1);
-        (void)w;
-        _exit(1);
+    if (g_maint) {
+        /* Deliberate maintenance is exempt, because killing the relay in the
+           middle of a tracefs operation is how a kill/restart loop starts. It
+           must not be silent forever either: after MAINT_WARN_MS, say once that
+           it has not returned. No exit, no signal is raised from here. */
+        long long m = g_maintStartMs;
+        long long held = (m && now_ms() > m) ? (now_ms() - m) : 0;
+        if (held > MAINT_WARN_MS && !g_maintWarned) {
+            g_maintWarned = 1;
+            char b[256];
+            size_t at = 0;
+            at = put_str(b, sizeof(b), at, "gxr_alvr: watchdog: tracefs maintenance has not returned for ");
+            at = put_ll(b, sizeof(b), at, held);
+            at = put_str(b, sizeof(b), at,
+                         " ms (or the process was not scheduled during it); not exiting "
+                         "(a mid-operation kill is unsafe), but the relay is not making progress\n");
+            ssize_t w = write(2, b, at);
+            (void)w;
+        }
+        return;
     }
+    long long gap = now_ms() - g_loopTickMs;
+    if (gap <= WATCHDOG_MS) return;
+    char b[224];
+    size_t at = 0;
+    if (gap > LONG_GAP_MS) {
+        g_loopTickMs = now_ms();                      /* resume from here */
+        g_printReset = 1;                             /* not a slow log write */
+        if (g_longGaps < 32000) g_longGaps++;
+        at = put_str(b, sizeof(b), at, "gxr_alvr: watchdog: no main-loop progress for ");
+        at = put_ll(b, sizeof(b), at, gap);
+        at = put_str(b, sizeof(b), at, " ms (over ");
+        at = put_ll(b, sizeof(b), at, LONG_GAP_MS);
+        at = put_str(b, sizeof(b), at,
+                     " ms); the process was not scheduled or was blocked, not a slow loop; resuming\n");
+    } else {
+        at = put_str(b, sizeof(b), at, "gxr_alvr: watchdog: main loop made no progress for ");
+        at = put_ll(b, sizeof(b), at, gap);
+        at = put_str(b, sizeof(b), at, " ms; exiting so the supervisor can restart\n");
+    }
+    ssize_t w = write(2, b, at);
+    (void)w;
+    if (gap <= LONG_GAP_MS) _exit(1);
 }
 
 int main(int argc, char **argv) {
@@ -1769,19 +2223,44 @@ int main(int argc, char **argv) {
 
     /* Single instance: exit if another live relay holds the lock. */
     if (acquire_lock() < 0) return 5;
+    /* One bounded line that makes the process's place in the system answerable
+       from an exported log (parent chain, cgroup, oom_score_adj). */
+    log_process_context();
 
     tracefs_cleanup();
     set_ring_kb();
+    /* The initial cleanup is itself a destructive device-wide operation, so the
+       re-arm floor clock starts here: a probe found missing by the first health
+       check must still wait REARM_MIN_MS before another device-wide clear. */
+    g_lastRearmMs = now_ms();
     g_pupil_off = pupil_off; g_eyedir_off = eyedir_off;
     g_face_off = face_off; g_jaw_off = jaw_off; g_tongue_off = tongue_off;
     g_eye_plugin = eye_plugin; g_face_plugin = face_plugin;
     usleep(200000);   /* let any just-pkill'd peer release tracefs */
-    if (arm_pupil(eye_plugin, pupil_off) != 0) return 3;
-    if (arm_eyedir(eye_plugin, eyedir_off) != 0) fprintf(stderr, "gxr_alvr: eyedir probe not armed (continuing)\n");
-    if (arm_face(face_plugin, face_off) != 0) fprintf(stderr, "gxr_alvr: face probe not armed (continuing)\n");
-    if (arm_jaw(face_plugin, jaw_off) != 0) fprintf(stderr, "gxr_alvr: jaw probe not armed (continuing)\n");
-    if (arm_tongue(face_plugin, tongue_off) != 0) fprintf(stderr, "gxr_alvr: tongue probe not armed (continuing)\n");
+    int rc_pten = arm_pupil(eye_plugin, pupil_off);
+    if (rc_pten != 0) return 3;
+    int rc_dir = arm_eyedir(eye_plugin, eyedir_off);
+    if (rc_dir != 0) fprintf(stderr, "gxr_alvr: eyedir probe not armed (continuing)\n");
+    int rc_face = arm_face(face_plugin, face_off);
+    if (rc_face != 0) fprintf(stderr, "gxr_alvr: face probe not armed (continuing)\n");
+    int rc_jaw = arm_jaw(face_plugin, jaw_off);
+    if (rc_jaw != 0) fprintf(stderr, "gxr_alvr: jaw probe not armed (continuing)\n");
+    int rc_tongue = arm_tongue(face_plugin, tongue_off);
+    if (rc_tongue != 0) fprintf(stderr, "gxr_alvr: tongue probe not armed (continuing)\n");
     write_file(TRACE "/tracing_on", "1\n");
+    /* The required set is the set of arm calls that returned success - never the
+       event-list snapshot. The snapshot is only an observational cache for the
+       heartbeat; if it cannot be read now, the probes that did arm are still
+       required and will be recovered if they disappear later. pten is mandatory
+       (its arm failure returned 3 above), optional failures stay out of the
+       baseline and are retried only by an explicit restart. The watchdog is not
+       armed yet, so this read cannot race a maintenance window. */
+    g_hcBaseMask = probe_mask_from_arms(rc_pten, rc_dir, rc_face, rc_jaw, rc_tongue);
+    unsigned smask = 0;
+    g_hcProbes = (probe_snapshot(&smask) == 0) ? probe_count(smask) : -1;
+    g_hcBase = probe_count(g_hcBaseMask);
+    g_hcOn = tracing_enabled();
+    g_hcMs = now_ms();
     fprintf(stderr, "gxr_alvr: v%s armed pten@0x%lx + eyedir@0x%lx + face68@0x%lx + jaw@0x%lx + tongue@0x%lx -> %s:%d (UniExpr)%s\n",
             GXR_VERSION, pupil_off, eyedir_off, face_off, jaw_off, tongue_off, target, port,
             g_have_mirror ? " +mirror" : "");
@@ -1811,16 +2290,41 @@ int main(int argc, char **argv) {
     pfd.fd = fd; pfd.events = POLLIN;
     long long nextHealth = now_ms() + SOCK_POLL_MS;
     long long nextHb = now_ms() + HB_MS;
-    /* Arm the watchdog now that nothing else can delay us before the loop. */
+    /* Arm the watchdog now that nothing else can delay us before the loop.
+       Report setup failures instead of silently running without one: a masked
+       or unarmed SIGALRM would make every stall invisible in the log. */
     g_loopTickMs = now_ms();
     g_printStartMs = g_loopTickMs;
+    int wdOk = 1;
     struct sigaction sw; memset(&sw, 0, sizeof(sw));
     sw.sa_handler = on_alarm; sigemptyset(&sw.sa_mask); sw.sa_flags = 0;
-    sigaction(SIGALRM, &sw, NULL);
-    struct itimerval it;
-    it.it_interval.tv_sec = 1; it.it_interval.tv_usec = 0;
-    it.it_value = it.it_interval;
-    setitimer(ITIMER_REAL, &it, NULL);
+    if (sigaction(SIGALRM, &sw, NULL) != 0) {
+        fprintf(stderr, "gxr_alvr: watchdog NOT armed (sigaction: %s); stalls will not be detected\n",
+                strerror(errno));
+        wdOk = 0;
+    } else {
+        sigset_t wdset;
+        sigemptyset(&wdset);
+        sigaddset(&wdset, SIGALRM);
+        if (sigprocmask(SIG_UNBLOCK, &wdset, NULL) != 0) {
+            fprintf(stderr, "gxr_alvr: watchdog NOT armed (SIGALRM could not be unblocked: %s)\n",
+                    strerror(errno));
+            wdOk = 0;
+        }
+    }
+    if (wdOk) {
+        struct itimerval it;
+        it.it_interval.tv_sec = 1; it.it_interval.tv_usec = 0;
+        it.it_value = it.it_interval;
+        if (setitimer(ITIMER_REAL, &it, NULL) != 0) {
+            fprintf(stderr, "gxr_alvr: watchdog NOT armed (setitimer: %s); stalls will not be detected\n",
+                    strerror(errno));
+        } else {
+            fprintf(stderr, "gxr_alvr: watchdog armed (1 s tick, %d ms progress timeout)\n",
+                    WATCHDOG_MS);
+        }
+    }
+    fflush(stderr);
     while (!g_stop) {
         /* Poll timeout: the active transmit period while the device is feeding
            us, and the long dormant one when it is not (see idle_now), so an
@@ -1859,6 +2363,10 @@ int main(int argc, char **argv) {
             }
         }
         long long tnow = now_ms();
+        if (g_printReset) {              /* apply a long-gap reset from the handler */
+            g_printReset = 0;
+            g_printStartMs = tnow;
+        }
         /* One recompute per COMPUTE_PERIOD_MS, not one per probe event: the probes
            cannot deliver more than ~57 Hz of eye data, so this is the fastest rate
            that buys anything. Deliberately independent of --tx-hz: a slow stream
@@ -1876,12 +2384,15 @@ int main(int argc, char **argv) {
             /* Tracefs maintenance. Re-arming, or re-enabling tracing, can make
                the kernel synchronise RCU and sit on a tracefs write for far
                longer than a loop tick, so tell the watchdog this is deliberate
-               and then mark progress ourselves. */
+               and then mark progress ourselves. The start time is recorded so
+               the watchdog can still say if maintenance itself never returns. */
+            g_maintStartMs = now_ms();
             g_maint = 1;
-            int fixed = health_check();
+            int hcFlags = health_check();
             refresh_target();
             g_loopTickMs = now_ms();
             g_maint = 0;
+            g_maintWarned = 0;
 
             /* Quiet, not stalled. Armed probes and tracing_on both look healthy
                while no events arrive at all -- and that is the NORMAL state: with
@@ -1892,39 +2403,37 @@ int main(int argc, char **argv) {
                could not fix anyway (a foreign trace_pipe consumer keeps draining
                whatever we rebuild). The precise self-heal is health_check() just
                above: it re-arms when our probe set or tracing_on really was changed
-               under us, and says so in the log. So report the episode instead of
-               churning tracefs. One line per episode; the next real event clears
-               g_quietActive. */
+               under us, and only after repeated confirmation. So report the episode
+               instead of churning tracefs, and report only what was verified.
+               One line per episode; the next real event clears g_quietActive. */
             long long idle = tnow - g_lastDataMs;
             if (g_stateOk && g_evCount > 0 && idle > QUIET_MS && !g_quietActive) {
+                char verdict[192];
+                hc_verdict(hcFlags, verdict, sizeof(verdict));
                 g_quietActive = 1;
                 g_quietCount++;
                 fprintf(stderr, "gxr_alvr: no probe events for %lld ms (ev=%lld tx=%lld, "
                                 "quiet episode #%d); tracefs %s\n",
-                        idle, g_evCount, g_txCount, g_quietCount,
-                        fixed ? "was unhealthy and has been re-armed"
-                              : "healthy, so this is idle rather than a fault");
+                        idle, g_evCount, g_txCount, g_quietCount, verdict);
             }
         }
 
         /* Heartbeat, written from the loop itself so it keeps coming even when
            the device says nothing. This is what separates "no data" from
            "wedged" and "dead" in the log. ev/tx/idle count only OUR probe events
-           (see feed_line). */
+           (see feed_line). probes=/on= come from the cached health snapshot and
+           hc= is its age, so the line reports a bounded-staleness observation
+           rather than touching tracefs from here. */
         if (tnow >= nextHb) {
             nextHb = tnow + g_hbMs;
-            int probes = 0;
-            if (event_present("pten")) probes++;
-            if (event_present("dir")) probes++;
-            if (event_present("bs")) probes++;
-            if (event_present("jaw")) probes++;
-            if (event_present("tongue")) probes++;
+            long long hcAge = g_hcMs ? (tnow - g_hcMs) : -1;
             g_printStartMs = now_ms();
             fprintf(stderr, "gxr_alvr: hb t=%lld ev=%lld tx=%lld cmp=%lld idle=%lldms probes=%d/5 "
-                            "on=%d quiet=%d verbose=%d\n",
+                            "base=%d/5 on=%d quiet=%d verbose=%d gaps=%d hc=%lldms\n",
                     tnow, g_evCount, g_txCount, g_computeCount,
                     g_lastDataMs ? (tnow - g_lastDataMs) : -1,
-                    probes, tracing_enabled(), g_quietCount, g_verbose);
+                    g_hcProbes, g_hcBase, g_hcOn, g_quietCount, g_verbose,
+                    (int)g_longGaps, hcAge);
             print_done();
             /* The heartbeat is the liveness proof, so it must reach the log now --
                even if stderr is buffered (it is, while verbose is on). */

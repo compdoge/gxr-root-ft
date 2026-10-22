@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
-# Offline harness for the module scripts. No device involved.
-#   - supervise.sh: rc=137 must be terminal (no respawn); other rcs must retry.
+# Offline harness for the module scripts and the sender's startup diagnostics.
+# No device involved.
+#   - supervise.sh: rc=137 must be terminal (no respawn); other rcs must retry;
+#     rc=5 must retry a bounded number of times and then stop with a reason.
 #   - webui.sh pause/resume/exportlog/dilcal logic, with the Android paths sandboxed.
+#   - gxr_alvr.c: compiles with a host cc when one is available, keeps the
+#     heartbeat off unprotected tracefs reads, keeps the watchdog's long-gap
+#     message free of unsupported claims, and requires confirmation/rate limits
+#     before a device-wide probe clear; the startup diagnostic, watchdog cases
+#     and health-verdict wording are run through tools/relay_selftest.c.
+#   - ksu-module/gxr-alvr/gxr_alvr: the tracked binary must embed the module.prop
+#     version and the new log strings, with no compiler or source tree needed.
 # The real scripts hardcode /data/local/tmp, /sys/kernel/tracing and
 # /sdcard/Download, so each copy is rewritten to a scratch directory; the
 # control flow is what is under test.
@@ -49,6 +58,50 @@ kill "$sup" 2>/dev/null
 wait "$sup" 2>/dev/null
 n=$(grep -c 'relay exited rc=1' "$S/tmp/gxr_alvr.log" 2>/dev/null)
 if [ "$n" -ge 2 ]; then ok "rc=1 still retries (attempts=$n)"; else bad "rc=1 did not retry (attempts=$n)"; fi
+
+# rc=5 (another relay holds the lock): bounded retries, then an explicit stop.
+# The old behaviour gave up on the first rc=5, which turned one lock collision
+# into a permanent outage; the new one must not loop forever either.
+rm -f "$S/tmp/gxr_alvr.log"
+cat > "$S/bin/relay5" <<'EOF'
+#!/usr/bin/env sh
+echo "relay-stub: lock busy"
+exit 5
+EOF
+chmod +x "$S/bin/relay5"
+t0=$(date +%s)
+sh "$S/supervise.sh" --loop "$S/bin/relay5" >/dev/null 2>&1
+rc5=$?
+elapsed=$(( $(date +%s) - t0 ))
+expect "rc=5 supervisor exits gracefully" "0" "$rc5"
+expect "rc=5 tried once plus LOCK_RETRY_MAX (3) retries" "4" "$(grep -c 'relay-stub: lock busy' "$S/tmp/gxr_alvr.log" 2>/dev/null)"
+grep -q 'retry 1/3' "$S/tmp/gxr_alvr.log" && ok "rc=5 logs a numbered retry" || bad "rc=5 retry line missing"
+grep -q 'retry 3/3' "$S/tmp/gxr_alvr.log" && ok "rc=5 stops retrying at the limit" || bad "rc=5 retry limit not logged"
+grep -q 'lock still held by pid=.* after 3 retries' "$S/tmp/gxr_alvr.log" \
+  && ok "rc=5 stop is explained, not silent" || bad "rc=5 stop line missing"
+if [ "$elapsed" -le 20 ]; then ok "rc=5 bound is bounded in time (${elapsed}s)"; else bad "rc=5 took ${elapsed}s"; fi
+
+# rc=5 once, then the holder is gone: the same supervisor must recover.
+rm -f "$S/tmp/gxr_alvr.log" "$S/lock_once"
+cat > "$S/bin/relay5once" <<EOF
+#!/usr/bin/env sh
+if [ -f "$S/lock_once" ]; then
+  echo "relay-stub: started after lock retry"
+  exit 0
+fi
+touch "$S/lock_once"
+echo "relay-stub: lock busy once"
+exit 5
+EOF
+chmod +x "$S/bin/relay5once"
+sh "$S/supervise.sh" --loop "$S/bin/relay5once" >/dev/null 2>&1 &
+sup5=$!
+sleep 5
+kill "$sup5" 2>/dev/null
+wait "$sup5" 2>/dev/null
+grep -q 'relay-stub: started after lock retry' "$S/tmp/gxr_alvr.log" \
+  && ok "rc=5 recovers when the lock is released" || bad "rc=5 did not recover after the lock was freed"
+grep -q 'retry 1/3' "$S/tmp/gxr_alvr.log" && ok "rc=5 recovery went through a retry" || bad "rc=5 recovery skipped the retry log"
 
 # ------------------------------------------------------------------- webui.sh
 echo "== webui.sh =="
@@ -223,6 +276,167 @@ out=$(sh "$W/module/webui.sh" status 2>&1)
 echo "$out" | grep -q "^dilmin=3.400$" && ok "status reports dilmin" || bad "status missing dilmin: $out"
 echo "$out" | grep -q "^dilmax=4.900$" && ok "status reports dilmax" || bad "status missing dilmax: $out"
 echo "$out" | grep -q "^dillock=0$" && ok "status reports dillock" || bad "status missing dillock: $out"
+
+# ------------------------------------------------- gxr_alvr.c source guards
+echo "== gxr_alvr.c =="
+SRC="$MOD/../../headset/gxr_alvr.c"
+if [ ! -f "$SRC" ]; then
+  bad "sender source not found at $SRC"
+else
+  CC_BIN=$(command -v cc 2>/dev/null || command -v gcc 2>/dev/null || true)
+  if [ -n "$CC_BIN" ]; then
+    if "$CC_BIN" -O2 -Wall -Wextra -o "$ROOT/gxr_alvr-host" "$SRC" -lm 2>"$ROOT/cc.log"; then
+      ok "sender compiles (-O2 -Wall -Wextra)"
+    else
+      bad "sender failed to compile"
+      sed 's/^/    /' "$ROOT/cc.log"
+    fi
+    if [ -x "$ROOT/gxr_alvr-host" ]; then
+      expect "built binary reports the module.prop version" \
+        "$(sed -n 's/^version=v//p' "$MOD/module.prop")" \
+        "$("$ROOT/gxr_alvr-host" --version | awk '{print $2}')"
+    fi
+    if "$CC_BIN" -O2 -Wall -Wextra -o "$ROOT/relay_selftest" \
+        "$(cd "$(dirname "$SELF")" && pwd)/relay_selftest.c" -lm 2>"$ROOT/cc2.log"; then
+      ok "relay selftest harness compiles"
+      diag=$("$ROOT/relay_selftest" 2>"$ROOT/selftest.err")
+      rc_self=$?
+      expect "relay selftest passes" "0" "$rc_self"
+      printf '%s\n' "$diag" | grep -q '^selftest_bad=0$' && ok "selftest reports zero failures" || bad "selftest failures: $diag"
+      dline=$("$ROOT/relay_selftest" 2>&1 >/dev/null | grep '^gxr_alvr: process:')
+      expect "context diagnostic is one line" "1" "$(printf '%s\n' "$dline" | wc -l | tr -d ' ')"
+      case "$dline" in
+        "gxr_alvr: process: pid="*) ok "context diagnostic names pid/ppid/parent" ;;
+        *) bad "context diagnostic shape: $dline" ;;
+      esac
+      printf '%s' "$dline" | grep -q ' cgroup=' && ok "context diagnostic includes cgroup" || bad "no cgroup field"
+      printf '%s' "$dline" | grep -q ' oom_score_adj=' && ok "context diagnostic includes oom_score_adj" || bad "no oom_score_adj field"
+      dlen=$(printf '%s' "$dline" | wc -c | tr -d ' ')
+      if [ "$dlen" -le 300 ]; then ok "context diagnostic is bounded ($dlen bytes)"; else bad "context diagnostic is $dlen bytes"; fi
+      printf '%s' "$dline" | grep -qiE 'token|secret|password|serial' \
+        && bad "context diagnostic looks like it could leak a secret" \
+        || ok "context diagnostic carries no secret-shaped fields"
+      grep -q 'not a slow loop; resuming' "$ROOT/selftest.err" \
+        && ok "watchdog long-gap message says it resumed" || bad "watchdog long-gap message missing"
+      grep -q 'maintenance has not returned' "$ROOT/selftest.err" \
+        && ok "maintenance overrun is reported" || bad "maintenance overrun message missing"
+      grep -q 'or the process was not scheduled during it' "$ROOT/selftest.err" \
+        && ok "maintenance overrun allows for not being scheduled" || bad "maintenance wording is incomplete"
+      grep -qi 'frozen' "$ROOT/selftest.err" \
+        && bad "watchdog message claims a freeze" || ok "watchdog message makes no freeze claim"
+    else
+      bad "relay selftest harness failed to compile"
+      sed 's/^/    /' "$ROOT/cc2.log"
+    fi
+  else
+    echo "  SKIP  host C build (no cc/gcc on PATH)"
+  fi
+
+  # Health-check safety: a read failure must be UNKNOWN, the expected set is the
+  # one this run actually armed, and a device-wide clear (which also drops other
+  # tools' probes) needs repeated confirmation plus a rate limit.
+  HC=$(sed -n '/^static int health_check/,/^}/p' "$SRC")
+  if [ -z "$HC" ]; then
+    bad "could not locate health_check"
+  else
+    printf '%s' "$HC" | grep -q 'if (snap < 0)' && ok "health check separates read failure from missing probes" || bad "no unknown-state branch"
+    printf '%s' "$HC" | grep -q 'g_hcBaseMask & ~mask' && ok "health check requires only probes this run armed" || bad "no baseline probe set"
+    printf '%s' "$HC" | grep -q 'HC_CONFIRM_MISS' && ok "re-arm requires repeated confirmation" || bad "no confirmation requirement"
+    printf '%s' "$HC" | grep -q 'rearm_allowed' && ok "re-arm pacing uses the testable floor helper" || bad "re-arm does not use the floor helper"
+    grep -q 'REARM_MIN_MS' "$SRC" && ok "re-arm floor is defined" || bad "no re-arm floor"
+    grep -q 'REARM_MAX_MS' "$SRC" && ok "re-arm backoff is capped" || bad "no capped re-arm backoff"
+    printf '%s' "$HC" | grep -q 'REARM_MAX_FAILS' && ok "re-arm attempts are bounded" || bad "no bound on failed re-arms"
+    printf '%s' "$HC" | grep -q 'HC_REARM_GAVEUP' && ok "giving up is reported to the verdict" || bad "give-up state is not reported"
+    printf '%s' "$HC" | grep -q 'verified\|could not be verified\|did not stick' && ok "health log reports verification" || bad "health log does not report verification"
+  fi
+  STARTUP=$(sed -n '/^int main/,/while (!g_stop)/p' "$SRC")
+  printf '%s' "$STARTUP" | grep -q 'g_lastRearmMs = now_ms()' && ok "startup starts the re-arm floor clock" || bad "startup does not set the re-arm floor"
+  printf '%s' "$STARTUP" | grep -q 'probe_mask_from_arms' && ok "startup baseline comes from arm results" || bad "startup baseline does not use arm results"
+  if printf '%s' "$STARTUP" | grep -q 'g_hcBaseMask |= smask'; then
+    bad "startup baseline is still taken from the snapshot"
+  else
+    ok "startup snapshot is observational only"
+  fi
+  PS=$(sed -n '/^static int probe_snapshot/,/^}/p' "$SRC")
+  printf '%s' "$PS" | grep -q 'errno == EINTR' && ok "probe read retries EINTR" || bad "probe read does not retry EINTR"
+  printf '%s' "$PS" | grep -q 'return -1' && ok "probe read can report unknown" || bad "probe read cannot report unknown"
+  printf '%s' "$PS" | grep -q 'PROBE_CARRY' && ok "probe read is incremental across chunks" || bad "probe read is not incremental"
+  printf '%s' "$PS" | grep -q 'HC_READ_MAX' && bad "probe read still has an oversized-buffer case" || ok "probe read has no oversized-buffer case"
+
+  # The heartbeat runs outside the g_maint window, so it must never reach into
+  # tracefs: a uprobe_events seq_file read serialises on the global event_mutex.
+  HB=$(sed -n '/if (tnow >= nextHb)/,/^        }$/p' "$SRC")
+  if [ -z "$HB" ]; then
+    bad "could not locate the heartbeat block"
+  elif printf '%s' "$HB" | grep -q 'hb t=' && \
+       ! printf '%s' "$HB" | grep -qE 'event_present|tracing_enabled|probe_snapshot|open\('; then
+    ok "heartbeat uses the cached health snapshot only"
+  else
+    bad "heartbeat touches tracefs directly"
+  fi
+
+  # A long gap must be reported as "not scheduled or blocked" and must resume,
+  # without asserting a freeze that the log cannot prove.
+  ALARM=$(sed -n '/^static void on_alarm/,/^}/p' "$SRC")
+  if [ -z "$ALARM" ]; then
+    bad "could not locate on_alarm"
+  else
+    printf '%s' "$ALARM" | grep -q 'LONG_GAP_MS' && ok "watchdog distinguishes a long gap" || bad "no long-gap branch"
+    printf '%s' "$ALARM" | grep -q 'resuming' && ok "watchdog resumes after a long gap" || bad "long gap does not resume"
+    printf '%s' "$ALARM" | grep -q '_exit(1)' && ok "watchdog still exits on a real loop stall" || bad "ordinary stall no longer exits"
+    printf '%s' "$ALARM" | grep -q 'MAINT_WARN_MS' && ok "watchdog reports overrunning maintenance" || bad "no maintenance overrun report"
+    printf '%s' "$ALARM" | grep -q 'g_printReset = 1' && ok "watchdog defers the log-marker reset" || bad "no deferred log-marker reset"
+    if printf '%s' "$ALARM" | grep -q 'g_printStartMs'; then
+      bad "watchdog handler writes the 64-bit log marker"
+    else
+      ok "watchdog handler leaves the log marker to the main loop"
+    fi
+    if printf '%s' "$ALARM" | grep -qi 'frozen'; then
+      bad "watchdog message claims a freeze"
+    else
+      ok "watchdog message makes no freeze claim"
+    fi
+  fi
+fi
+
+# ------------------------------------- packaged/tracked sender binary version
+# Independent of any host compiler and of the source tree: the binary that the
+# module actually ships must be the new build, i.e. it must embed the version
+# from module.prop and the new log strings, and must not still carry the old
+# watchdog text.
+echo "== module binary =="
+BIN="$MOD/gxr_alvr"
+MPVER=$(sed -n 's/^version=v//p' "$MOD/module.prop")
+if [ ! -f "$BIN" ]; then
+  bad "module binary missing: $BIN"
+else
+  if LC_ALL=C grep -aq "$MPVER" "$BIN"; then
+    ok "tracked module binary embeds version $MPVER"
+  else
+    bad "tracked module binary does not embed $MPVER (stale build?)"
+  fi
+  for marker in "gxr_alvr: process:" "was not scheduled or was blocked" \
+                "could not read uprobe_events" "did not stick" \
+                "a required probe had disappeared" "automatic re-arm disabled"; do
+    if LC_ALL=C grep -aq "$marker" "$BIN"; then
+      ok "module binary contains new code marker: $marker"
+    else
+      bad "module binary lacks new code marker: $marker (stale build?)"
+    fi
+  done
+  if LC_ALL=C grep -aq "main loop stalled" "$BIN"; then
+    bad "module binary still contains the old watchdog message"
+  else
+    ok "module binary has no old watchdog message"
+  fi
+  if [ ! -f "$MOD/../../headset/gxr_alvr" ]; then
+    echo "  SKIP  headset/gxr_alvr absent (it is an ignored build output)"
+  elif cmp -s "$BIN" "$MOD/../../headset/gxr_alvr"; then
+    ok "module binary and headset/gxr_alvr are identical"
+  else
+    bad "module binary differs from headset/gxr_alvr"
+  fi
+fi
 
 echo
 echo "passed=$pass failed=$fail"

@@ -1,6 +1,6 @@
 id=gxr-alvr
 name=Galaxy XR face tracking relay
-version=v1.3.11
-versionCode=32
+version=v1.3.12
+versionCode=33
 author=komp
 description=Starts the Galaxy XR perception relay (gxr_alvr) as root at boot (and on late-load). Auto-connects to the PC by broadcasting the full UE parameter set (incl. TongueRoll) on UDP 41463 (no PC setup needed); set the PC's IP from the Manager WebUI (module page) or the pc/port files. Wire format: one ALVR "UniExpr" record.

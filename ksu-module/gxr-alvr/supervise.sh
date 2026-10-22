@@ -4,34 +4,62 @@
 # config is read in exactly one place.
 #
 # The supervisor exists for two reasons:
-#   - the sender has a watchdog that EXITS when its main loop stalls, and
+#   - the sender has a watchdog that exits when its main loop really stalls (a
+#     long unscheduled gap is logged and survived instead, see gxr_alvr.c), and
 #   - nothing used to restart the relay after any exit, so one crash meant a
 #     reboot or a manual Action tap.
 # Because of it, a deliberate stop must kill the SUPERVISOR first: killing the
 # relay alone would just make the supervisor start it again.
 #
-# Two exits are terminal and are NOT restarted: rc=5 (another live relay holds
-# the lock) and rc=137 (something outside this module killed the relay). See the
-# respawn loop below for why.
+# Two exits are terminal and are NOT restarted: rc=137 (something outside this
+# module killed the relay) and rc=5 once its bounded retries are used up (another
+# relay holds the single-instance lock). See the respawn loop below for why.
 MODDIR=${0%/*}
 [ -f "$MODDIR/module.prop" ] || MODDIR=/data/adb/modules/gxr-alvr
 LOG=/data/local/tmp/gxr_alvr.log
+# rc=5 means another relay holds the flock. The holder may be the healthy relay
+# that won a start race, an instance that has not finished its own SIGTERM exit
+# (the relay disarms tracefs on the way out, which can take a moment), or one
+# that is stopped/blocked and will never release the lock. A few fixed retries
+# give only the "still exiting" case time to finish; they do NOT recover a stuck
+# holder. Never keep spawning: the lock, not this loop, prevents two relays.
+LOCK_RETRY_MAX=3
+LOCK_RETRY_S=2
+
+# pkill is not guaranteed to be on PATH in the minimal shell the Manager and the
+# installer run with (customize.sh already carries the same fallback).
+kill_matching() {
+  /system/bin/pkill "$@" 2>/dev/null && return 0
+  pkill "$@" 2>/dev/null && return 0
+  return 1
+}
 
 # --loop <bin> <relay args...>: this is the supervisor itself.
 if [ "$1" = "--loop" ]; then
   shift
   delay=2
+  lock_fail=0
   while :; do
     started=$(date +%s)
     "$@" </dev/null >>"$LOG" 2>&1
     rc=$?
     ran=$(( $(date +%s) - started ))
     if [ "$rc" = "5" ]; then
-      # Another live relay holds the single-instance lock. Retrying cannot fix
-      # that, it would only fight the instance that is already running.
-      echo "gxr-alvr: relay exited rc=5 (another relay holds the lock); supervisor stopping" >>"$LOG"
+      holder=$(pidof gxr_alvr 2>/dev/null)
+      if [ "$lock_fail" -lt "$LOCK_RETRY_MAX" ]; then
+        # Retrying is safe: a losing start exits before it touches tracefs, so
+        # it cannot disturb the relay that holds the lock.
+        lock_fail=$((lock_fail + 1))
+        echo "gxr-alvr: relay exited rc=5 (another relay holds the lock; holder pid=${holder:-unknown}); retry ${lock_fail}/${LOCK_RETRY_MAX} in ${LOCK_RETRY_S}s" >>"$LOG"
+        sleep "$LOCK_RETRY_S"
+        continue
+      fi
+      # Out of retries. Do not start a second relay and do not kill the holder:
+      # it may be the healthy one. Say so instead of stopping silently.
+      echo "gxr-alvr: relay exited rc=5; lock still held by pid=${holder:-unknown} after ${LOCK_RETRY_MAX} retries. Not starting a second relay and not killing the holder from here: it is either the relay that won the start or one that is stopped/blocked and cannot release the lock, and retries cannot free a stopped holder. Supervisor stopping; tap Action or WebUI Resume to try again" >>"$LOG"
       exit 0
     fi
+    lock_fail=0
     if [ "$rc" = "137" ]; then
       # 128+9: something OUTSIDE this module sent SIGKILL (on Android that is
       # usually lmkd under memory pressure, or a vendor/thermal policy killing
@@ -82,11 +110,11 @@ if [ -f "$MODDIR/dev" ] && [ -x /data/local/tmp/gxr_alvr ]; then
 fi
 
 # ---- stop the previous pair: supervisor first, or it resurrects the relay ----
-pkill -f "$MODDIR/supervise.sh --loop" 2>/dev/null
+kill_matching -f "$MODDIR/supervise.sh --loop"
 sleep 1
-pkill -x gxr_alvr 2>/dev/null
+kill_matching -x gxr_alvr
 sleep 1
-pidof gxr_alvr >/dev/null 2>&1 && { pkill -9 -x gxr_alvr 2>/dev/null; sleep 1; }
+pidof gxr_alvr >/dev/null 2>&1 && { kill_matching -9 -x gxr_alvr; sleep 1; }
 
 # ---- fresh log per start; the previous run is kept as .1 for diagnosis ----
 [ -f "$LOG" ] && mv -f "$LOG" "$LOG.1"

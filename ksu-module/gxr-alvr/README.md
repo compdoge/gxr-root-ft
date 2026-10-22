@@ -15,6 +15,10 @@ the troubleshooting notes - nothing arrives, auto-connect flaky, Wi-Fi
 trackers/streaming stutter - are in the
 [repo README](https://github.com/compdoge/gxr-root-ft#readme).
 
+The relay reports its own build in the `armed` log line, so after installing a
+build check that it matches the module version shown by the Manager (for example
+`v1.3.12 armed`). A mismatch means the zip carried an older `gxr_alvr` binary.
+
 The rest of this file is reference.
 
 
@@ -201,12 +205,49 @@ run is kept as `gxr_alvr.log.1`). The relay also logs `armed ...` / `auto target
 stall is visible even when nothing is arriving:
 
 ```
-gxr_alvr: hb t=<ms> ev=<probe events> tx=<datagrams> cmp=<frames computed> idle=<ms since last event> probes=<n>/5 on=<1|0> quiet=<n> verbose=<1|0>
+gxr_alvr: hb t=<ms> ev=<probe events> tx=<datagrams> cmp=<frames computed> idle=<ms since last event> probes=<n>/5 base=<n>/5 on=<1|0> quiet=<n> verbose=<1|0> gaps=<n> hc=<ms>
 ```
 
 `cmp` counts recomputes of the outgoing frame. Since v1.3.11 that should track
 `tx` (about 60/s at the default rate) rather than `ev`; before v1.3.11 it
 followed the ~15 Hz expression events.
+
+`probes=` and `on=` are the **last health-check snapshot**, not a live read, and
+`hc=` is that snapshot's age in ms (normally at most 3000). Reading the tracefs
+event list takes a kernel lock that probe creation anywhere on the device also
+needs, so the heartbeat must not do it: the 3 s health check samples it inside
+the relay's maintenance guard (one streamed scan, plus one verification scan after
+a re-arm), and the heartbeat reports that cached result (seeded once at startup,
+before the first beat). `-1` means **unknown** (the read failed or has not
+happened yet) - never "healthy" and never "gone". `gaps=` counts long no-progress
+gaps the relay resumed from (see the watchdog note below).
+
+`base=` is the probe set **this run's arm calls actually succeeded on at
+startup** (plus anything a later verified re-arm restored), so a start where an
+optional probe could not be armed legitimately reports `probes=4/5 base=4/5` for
+its whole life. The startup event-list read is only an observational cache for
+the heartbeat and never decides what is required, so a failed startup read does
+not shrink the baseline. `pten` is mandatory: if its uprobe cannot be armed the
+relay exits `rc=3` instead of running without pupil data. The other four are
+optional; one that failed at startup is only retried by an explicit restart
+(Manager **Action**, WebUI **Resume**, or a reboot), never by clearing the
+device-wide probe set in a loop. A `probes=` below `base=` means a probe that was
+armed has disappeared; that is recovered as described under *quiet episodes*
+below.
+
+The first lines of a run also record **where the process came from**:
+
+```
+gxr_alvr: process: pid=... ppid=... parent=sh chain=sh<sh<ksud<init cgroup=0::/... oom_score_adj=0
+```
+
+`chain` is the parent chain (up to four ancestors, nearest first); the example
+is a boot start, where a Manager start instead shows the Manager app in place of
+`ksud`. `cgroup` is `/proc/self/cgroup`. A start from the Manager **Action**
+button or the WebUI normally shows the Manager app in that chain and an app
+cgroup; a boot start does not. Only those kernel identity fields are logged - no
+environment, no argv - the values are length-capped and stripped of control
+characters, and a failed read prints `unknown`.
 
 `idle` climbing while `ev` stands still means the device is not feeding us;
 `ev` still climbing but `tx` frozen would mean the transmit side is wedged; no
@@ -216,12 +257,48 @@ probe events, so other tracefs users cannot make the link look alive.
 A quiet device is the **normal** state: with no app asking for tracking, nothing
 calls the probed functions. Silence therefore proves nothing by itself, so when no
 event has arrived for 3 s the relay logs one
-`no probe events for ... quiet episode #n` line per episode and names the tracefs
-verdict - **healthy, so this is idle rather than a fault**, or **was unhealthy and
-has been re-armed**. The re-arm only happens when the 3 s health check finds that
-our probe set or `tracing_on` really was changed under us. It is deliberately not
-triggered by idleness: re-arming clears every uprobe on the device, and it could
-not fix the one case it cannot see (a foreign `trace_pipe` consumer) anyway.
+`no probe events for ... quiet episode #n` line per episode and quotes the tracefs
+verdict it actually established: healthy (idle, not a fault), re-armed, a re-arm
+that did not restore the set, a `tracing_on` problem, a required probe missing
+but not yet confirmed, automatic re-arming stopped after repeated failures
+(restart to retry), or state unverifiable. Clearing `uprobe_events`
+drops **every** uprobe on the device, including a capture tool's, so the relay
+only does that after three consecutive successful health-check reads show a probe
+that it had armed missing, with a 30 s floor counted from the initial tracefs
+cleanup (so even a fault visible at the first check waits) that doubles while
+re-arms keep failing (capped at 10 minutes) instead of churning. After **five**
+failed re-arms it stops trying and logs that a restart is needed to retry. A
+failed read is reported as unknown; it is never treated as evidence that the
+probes are gone, and re-arming is deliberately not triggered by idleness: it
+could not fix the one case it cannot see (a foreign `trace_pipe` consumer)
+anyway.
+
+If the heartbeat itself stops, the sender's own 5 s watchdog decides what the gap
+means. A gap of 5-15 s is treated as a real loop stall: it logs one line and exits
+so the supervisor restarts the relay. A gap longer than 15 s (three watchdog
+periods) is treated differently: the timer handler only runs once the process is
+back in user mode, so a gap that long means the process was not running at all -
+stopped, frozen by a platform policy, or parked in the kernel - and the log cannot
+tell those apart. The relay then logs one
+
+```
+gxr_alvr: watchdog: no main-loop progress for <ms> ms (over 15000 ms); the process was not scheduled or was blocked, not a slow loop; resuming
+```
+
+line and keeps running with its tracefs state and learned dilation range intact
+instead of exiting; a genuine userspace spin still trips the 5 s branch within one
+watchdog period of that reset. The message deliberately does not name a cause. The
+line is also counted in the next heartbeat as `gaps=<n>`.
+
+The watchdog's own setup is reported: if `sigaction`/`setitimer` fails or SIGALRM
+cannot be unblocked, startup logs `watchdog NOT armed` instead of running without
+one silently. Tracefs maintenance is exempt from the progress check (killing the
+relay in the middle of a tracefs operation is how a kill/restart loop starts), but
+it is not allowed to be silent forever: if maintenance has not returned after
+15 s, one `tracefs maintenance has not returned for <ms> ms (or the process was
+not scheduled during it); not exiting ...` line is written when the process next
+executes user code (a syscall blocked in the kernel reports it on return, not
+while it is blocked). That is a report, not a diagnosis.
 
 `verbose` adds the tuning trace (~20 Hz gaze, 4 Hz pupil). Its lines carry what a
 field capture needs to explain an eye: `open=` is the EMITTED openness (so the
@@ -275,13 +352,25 @@ session - which was sized for an old blocking-read stall that no longer exists.
   its own no longer stops the relay -- it comes straight back. Stop the
   supervisor first, or just use the Manager's **Action** button. A relay that
   keeps failing to start is retried with a growing delay (2 s up to 60 s).
-- Two exits are **not** retried. `rc=5` (another live relay holds the lock) and
-  `rc=137` (SIGKILL from outside the module - usually the low-memory killer, or a
-  vendor/thermal policy shedding background work). The second one matters: that
-  kill is the system's decision about this process, and restarting means
-  rebuilding every uprobe and asking for the ring buffer again, i.e. putting back
-  the load it was shedding. The supervisor logs it and stops instead; start the
-  relay again from the Manager **Action** button or the WebUI **Resume**.
+- Two exits are special. `rc=137` (SIGKILL from outside the module - usually the
+  low-memory killer, or a vendor/thermal policy shedding background work) is not
+  retried: that kill is the system's decision about this process, and restarting
+  means rebuilding every uprobe and asking for the ring buffer again, i.e. putting
+  back the load it was shedding. The supervisor logs it and stops instead; start
+  the relay again from the Manager **Action** button or the WebUI **Resume**.
+  `rc=5` (another relay holds the single-instance lock) is retried **3 times,
+  2 s apart**: the holder may be an instance that is still finishing its own
+  SIGTERM exit (the relay disarms tracefs on the way out). Those retries do
+  **not** recover a stopped/blocked holder. If the lock is still held after them,
+  the supervisor logs the holder's pid and stops rather than fighting it: the
+  holder may be the healthy relay that won the start, or one that is stuck, and
+  the start path cannot tell them apart. The log line says so - it is never a
+  silent stop - and Action or Resume starts a fresh attempt later.
+- **App lifecycle:** a start from the Manager **Action** button or the WebUI runs
+  in a process tree that inherited the Manager's app context; a boot start does
+  not. The `process:` log line records the chain, cgroup and `oom_score_adj` the
+  run actually got, so an exported log answers which one it was. If the link must
+  survive the Manager being backgrounded, prefer the boot start.
 - Wire format is fixed: `"UniExpr\0"` + 88 `float32` UE weights + an 11-float eye
   tail (99 floats, 396 B payload, 404 B datagram). Do not change it without
   updating the PC-side module.

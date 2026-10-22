@@ -11,6 +11,14 @@ TRACE=/sys/kernel/tracing
 
 readval() { [ -f "$MODDIR/$1" ] && cat "$MODDIR/$1" 2>/dev/null; }
 
+# pkill is not guaranteed to be on PATH in the minimal shell the Manager runs
+# with (same workaround as customize.sh and supervise.sh).
+kill_matching() {
+  /system/bin/pkill "$@" 2>/dev/null && return 0
+  pkill "$@" 2>/dev/null && return 0
+  return 1
+}
+
 # numval <text> -> canonical "%.3f" on stdout, exit 1 when it is not a number in (0,100]
 numval() {
   case "$1" in ''|.|*[!0-9.]*|*.*.*) return 1 ;; esac
@@ -123,11 +131,11 @@ case "$1" in
           awk -v a="$LO" -v b="$HI" 'BEGIN { exit !(b + 0 > a + 0) }' \
             || { echo "error=min must be below max"; exit 1; }
         fi
-        pkill -f "$MODDIR/supervise.sh --loop" 2>/dev/null
+        kill_matching -f "$MODDIR/supervise.sh --loop"
         sleep 1
-        pkill -x gxr_alvr 2>/dev/null
+        kill_matching -x gxr_alvr
         sleep 1
-        pidof gxr_alvr >/dev/null 2>&1 && { pkill -9 -x gxr_alvr 2>/dev/null; sleep 1; }
+        pidof gxr_alvr >/dev/null 2>&1 && { kill_matching -9 -x gxr_alvr; sleep 1; }
         if [ "$2" = "set" ]; then
           printf '%s\n' "$LO" > "$MODDIR/dilmin"
           printf '%s\n' "$HI" > "$MODDIR/dilmax"
@@ -155,9 +163,9 @@ case "$1" in
     # probes and clear uprobe_events on the way out, so a paused module is
     # genuinely not tracing anything. This is the honest A/B switch for
     # "is the module making my headset hot": one tap, no reboot, no zip swap.
-    pkill -f "$MODDIR/supervise.sh --loop" 2>/dev/null
+    kill_matching -f "$MODDIR/supervise.sh --loop"
     sleep 1
-    pkill -x gxr_alvr 2>/dev/null
+    kill_matching -x gxr_alvr
     sleep 1
     if pidof gxr_alvr >/dev/null 2>&1; then
       echo "error=relay did not stop (pid $(pidof gxr_alvr))"; exit 1
